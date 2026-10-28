@@ -161,7 +161,16 @@ export class PeerSession {
         return;
       }
       if (state === 'disconnected') this.#setState('disconnected');
-      if (state === 'connected' && this.channel) this.#setState('connected');
+      // Only report "connected" when the DATA CHANNEL is open, not merely the
+      // peer connection: ICE+DTLS can complete a beat before SCTP finishes
+      // opening the channel, and consumers treat "connected" as "safe to
+      // send". Reporting it early made the sender engine start on a
+      // still-connecting channel and instantly fail with PEER_CLOSED
+      // (reproducible on loopback, where that window is hit almost every
+      // time). The channel's own 'open' event is the authoritative trigger.
+      if (state === 'connected' && this.channel && this.channel.readyState === 'open') {
+        this.#setState('connected');
+      }
       if (state === 'closed') this.close('pc-closed');
     };
 
