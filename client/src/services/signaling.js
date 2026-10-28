@@ -204,12 +204,19 @@ export function createSignalingClient(options = {}) {
       return () => connectionWatchers.delete(handler);
     },
 
-    createSession: (code) => request('session:create', { code }),
+    createSession: (code, options = {}) =>
+      request('session:create', {
+        code,
+        mode: options.mode,
+        maxReceivers: options.maxReceivers,
+      }),
     joinSession: (code) => request('session:join', { code }),
-    approve: () => request('session:approve', {}),
-    rejectPeer: (reason) => request('session:reject', { reason }),
-    signal: (signal) => request('session:signal', { signal }),
-    markActive: () => request('session:active', {}),
+    approve: (receiverId) => request('session:approve', receiverId ? { receiverId } : {}),
+    approveAll: () => request('session:approve-all', {}),
+    rejectPeer: (reason, receiverId) =>
+      request('session:reject', receiverId ? { reason, receiverId } : { reason }),
+    signal: (signal, receiverId) => request('session:signal', receiverId ? { signal, receiverId } : { signal }),
+    markActive: (receiverId) => request('session:active', receiverId ? { receiverId } : {}),
     cancel: (reason) => request('session:cancel', { reason }),
     leave: () => request('session:leave', {}),
 

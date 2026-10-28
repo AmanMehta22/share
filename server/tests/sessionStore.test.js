@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { SessionStore, SessionState, SessionError } from '../src/services/sessionStore.js';
+import { SessionStore, SessionState, ReceiverState, SessionError } from '../src/services/sessionStore.js';
 
 const CODE_HASH_A = 'a'.repeat(64);
 const CODE_HASH_B = 'b'.repeat(64);
@@ -18,7 +18,9 @@ describe('SessionStore.create', () => {
     const session = store.create({ codeHash: CODE_HASH_A, ip: '1.1.1.1', senderSocketId: 's1' });
     expect(session.state).toBe(SessionState.WAITING);
     expect(session.senderSocketId).toBe('s1');
-    expect(session.receiverSocketId).toBeNull();
+    expect(session.mode).toBe('direct');
+    expect(session.maxReceivers).toBe(1);
+    expect(session.receivers.size).toBe(0);
     expect(session.expiresAt).toBeGreaterThan(store.now());
   });
 
@@ -65,7 +67,7 @@ describe('SessionStore join lifecycle', () => {
     const joined = store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
     expect(joined.id).toBe(session.id);
     expect(joined.state).toBe(SessionState.PAIRED);
-    expect(joined.receiverSocketId).toBe('r1');
+    expect(joined.receivers.get('r1').state).toBe(ReceiverState.WAITING);
   });
 
   it('rejects a wrong code with NOT_FOUND', () => {
@@ -91,7 +93,7 @@ describe('SessionStore join lifecycle', () => {
     store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
     expect(store.releaseReceiver({ sessionId: session.id, socketId: 'r1' })).toBe(true);
     const again = store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r2' });
-    expect(again.receiverSocketId).toBe('r2');
+    expect(again.receivers.get('r2').state).toBe(ReceiverState.WAITING);
     expect(again.state).toBe(SessionState.PAIRED);
   });
 
@@ -125,7 +127,7 @@ describe('SessionStore rate limiting of joins', () => {
     // The correct code, same IP, is a different pair -> still allowed.
     store.create({ codeHash: CODE_HASH_A, ip: '1.1.1.1', senderSocketId: 's1' });
     const joined = store.join({ codeHash: CODE_HASH_A, ip: '5.5.5.5', receiverSocketId: 'ry' });
-    expect(joined.receiverSocketId).toBe('ry');
+    expect(joined.receivers.has('ry')).toBe(true);
   });
 
   it('caps brute-forcing many different codes from one IP', () => {
@@ -148,7 +150,7 @@ describe('SessionStore rate limiting of joins', () => {
     store.create({ codeHash: CODE_HASH_A, ip: '1.1.1.1', senderSocketId: 's1' });
     // A different IP can still join the correct code.
     const joined = store.join({ codeHash: CODE_HASH_A, ip: '9.9.9.9', receiverSocketId: 'r2' });
-    expect(joined.receiverSocketId).toBe('r2');
+    expect(joined.receivers.has('r2')).toBe(true);
   });
 });
 
@@ -187,10 +189,11 @@ describe('SessionStore approve / markActive / reject', () => {
     expect(() => store.markActive({ sessionId: session.id, socketId: 's1' })).toThrow();
   });
 
-  it('rejectReceiver closes the session and returns the receiver id', () => {
-    const receiverId = store.rejectReceiver({ sessionId: session.id, socketId: 's1' });
-    expect(receiverId).toBe('r1');
-    expect(store.get(session.id)).toBeUndefined();
+  it('rejectReceiver removes the receiver and returns its id (session survives; signaling closes direct sessions)', () => {
+    const ids = store.rejectReceiver({ sessionId: session.id, socketId: 's1' });
+    expect(ids).toEqual(['r1']);
+    expect(store.get(session.id).receivers.size).toBe(0);
+    expect(store.get(session.id).state).toBe(SessionState.WAITING);
   });
 });
 
@@ -282,5 +285,199 @@ describe('SessionStore close semantics', () => {
   it('close of an unknown id returns undefined', () => {
     const store = makeStore();
     expect(store.close({ sessionId: 'nope' })).toBeUndefined();
+  });
+});
+
+describe('SessionStore group mode', () => {
+  function makeGroupStore(options = {}) {
+    return makeStore({ maxReceiversPerSession: 4, ...options });
+  }
+
+  function createGroup(store, maxReceivers = 3) {
+    return store.create({
+      codeHash: CODE_HASH_A,
+      ip: '1.1.1.1',
+      senderSocketId: 's1',
+      mode: 'group',
+      maxReceivers,
+    });
+  }
+
+  it('rejects an unknown mode', () => {
+    const store = makeGroupStore();
+    expect(() => store.create({ codeHash: CODE_HASH_A, ip: 'x', senderSocketId: 's1', mode: 'broadcast' })).toThrow(
+      /unknown transfer mode/i
+    );
+  });
+
+  it('clamps maxReceivers to the store cap and floors at 1', () => {
+    const store = makeGroupStore({ maxReceiversPerSession: 4 });
+    const make = (codeHash, maxReceivers) =>
+      store.create({ codeHash, ip: '1.1.1.1', senderSocketId: 's1', mode: 'group', maxReceivers });
+    expect(make('a'.repeat(64), 99).maxReceivers).toBe(4);
+    expect(make('b'.repeat(64), 0).maxReceivers).toBe(1);
+    expect(make('c'.repeat(64), 'nonsense').maxReceivers).toBe(4);
+  });
+
+  it('lets multiple receivers join until capacity, then SESSION_FULL', () => {
+    const store = makeGroupStore();
+    createGroup(store, 2);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    store.join({ codeHash: CODE_HASH_A, ip: '3.3.3.3', receiverSocketId: 'r2' });
+    try {
+      store.join({ codeHash: CODE_HASH_A, ip: '4.4.4.4', receiverSocketId: 'r3' });
+      expect.unreachable();
+    } catch (error) {
+      expect(error.code).toBe('SESSION_FULL');
+    }
+  });
+
+  it('direct mode still rejects a second receiver with RECEIVER_TAKEN', () => {
+    const store = makeGroupStore();
+    store.create({ codeHash: CODE_HASH_A, ip: '1.1.1.1', senderSocketId: 's1' });
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    try {
+      store.join({ codeHash: CODE_HASH_A, ip: '3.3.3.3', receiverSocketId: 'r2' });
+      expect.unreachable();
+    } catch (error) {
+      expect(error.code).toBe('RECEIVER_TAKEN');
+    }
+  });
+
+  it('derives the aggregate state from the per-receiver states', () => {
+    const store = makeGroupStore();
+    const session = createGroup(store, 3);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    expect(store.get(session.id).state).toBe(SessionState.PAIRED);
+    store.join({ codeHash: CODE_HASH_A, ip: '3.3.3.3', receiverSocketId: 'r2' });
+    store.approve({ sessionId: session.id, socketId: 's1', receiverId: 'r1' });
+    expect(store.get(session.id).state).toBe(SessionState.APPROVED);
+    store.markActive({ sessionId: session.id, socketId: 's1', receiverId: 'r1' });
+    expect(store.get(session.id).state).toBe(SessionState.ACTIVE);
+    // One active receiver keeps the session ACTIVE even while r2 still waits.
+    expect(store.get(session.id).receivers.get('r2').state).toBe(ReceiverState.WAITING);
+  });
+
+  it('approves a specific receiver by id', () => {
+    const store = makeGroupStore();
+    const session = createGroup(store, 2);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    store.join({ codeHash: CODE_HASH_A, ip: '3.3.3.3', receiverSocketId: 'r2' });
+    const approvedId = store.approve({ sessionId: session.id, socketId: 's1', receiverId: 'r2' });
+    expect(approvedId).toBe('r2');
+    expect(store.get(session.id).receivers.get('r2').state).toBe(ReceiverState.APPROVED);
+    expect(store.get(session.id).receivers.get('r1').state).toBe(ReceiverState.WAITING);
+  });
+
+  it('approving an unknown receiver id is RECEIVER_GONE', () => {
+    const store = makeGroupStore();
+    const session = createGroup(store, 2);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    expect(() => store.approve({ sessionId: session.id, socketId: 's1', receiverId: 'ghost' })).toThrow(
+      /no longer connected/i
+    );
+  });
+
+  it('approving an already-approved receiver is INVALID_STATE', () => {
+    const store = makeGroupStore();
+    const session = createGroup(store, 2);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    store.approve({ sessionId: session.id, socketId: 's1', receiverId: 'r1' });
+    expect(() => store.approve({ sessionId: session.id, socketId: 's1', receiverId: 'r1' })).toThrow(
+      /already approved/i
+    );
+  });
+
+  it('approveAll approves every waiting receiver and returns their ids', () => {
+    const store = makeGroupStore();
+    const session = createGroup(store, 3);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    store.join({ codeHash: CODE_HASH_A, ip: '3.3.3.3', receiverSocketId: 'r2' });
+    const ids = store.approveAll({ sessionId: session.id, socketId: 's1' });
+    expect(ids).toEqual(['r1', 'r2']);
+    for (const receiver of store.get(session.id).receivers.values()) {
+      expect(receiver.state).toBe(ReceiverState.APPROVED);
+    }
+  });
+
+  it('approveAll with nobody waiting is INVALID_STATE', () => {
+    const store = makeGroupStore();
+    const session = createGroup(store, 2);
+    expect(() => store.approveAll({ sessionId: session.id, socketId: 's1' })).toThrow(/no receiver/i);
+  });
+
+  it('only the sender can approve in group mode', () => {
+    const store = makeGroupStore();
+    const session = createGroup(store, 2);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    expect(() => store.approve({ sessionId: session.id, socketId: 'r1', receiverId: 'r1' })).toThrow(
+      /only the sender/i
+    );
+  });
+
+  it('markActive on a waiting receiver is INVALID_STATE; unknown id is RECEIVER_GONE', () => {
+    const store = makeGroupStore();
+    const session = createGroup(store, 2);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    expect(() => store.markActive({ sessionId: session.id, socketId: 's1', receiverId: 'r1' })).toThrow(
+      /not ready/i
+    );
+    expect(() => store.markActive({ sessionId: session.id, socketId: 's1', receiverId: 'ghost' })).toThrow(
+      /no longer connected/i
+    );
+  });
+
+  it('rejectReceiver with an id removes only that receiver', () => {
+    const store = makeGroupStore();
+    const session = createGroup(store, 3);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    store.join({ codeHash: CODE_HASH_A, ip: '3.3.3.3', receiverSocketId: 'r2' });
+    const ids = store.rejectReceiver({ sessionId: session.id, socketId: 's1', receiverId: 'r1' });
+    expect(ids).toEqual(['r1']);
+    expect(store.get(session.id).receivers.has('r2')).toBe(true);
+    expect(store.get(session.id).receivers.has('r1')).toBe(false);
+  });
+
+  it('rejectReceiver without an id removes only waiting receivers', () => {
+    const store = makeGroupStore();
+    const session = createGroup(store, 3);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    store.join({ codeHash: CODE_HASH_A, ip: '3.3.3.3', receiverSocketId: 'r2' });
+    store.approve({ sessionId: session.id, socketId: 's1', receiverId: 'r1' });
+    const ids = store.rejectReceiver({ sessionId: session.id, socketId: 's1' });
+    expect(ids).toEqual(['r2']);
+    expect(store.get(session.id).receivers.has('r1')).toBe(true);
+  });
+
+  it('removeReceiver drops an approved receiver and returns its record', () => {
+    const store = makeGroupStore();
+    const session = createGroup(store, 2);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    store.approve({ sessionId: session.id, socketId: 's1', receiverId: 'r1' });
+    const removed = store.removeReceiver({ sessionId: session.id, socketId: 'r1' });
+    expect(removed.state).toBe(ReceiverState.APPROVED);
+    expect(store.get(session.id).receivers.size).toBe(0);
+    expect(store.get(session.id).state).toBe(SessionState.WAITING);
+    expect(store.removeReceiver({ sessionId: session.id, socketId: 'ghost' })).toBeUndefined();
+  });
+
+  it('an active group session is exempt from the TTL like a direct one', () => {
+    let clock = 1_000_000;
+    const store = makeGroupStore({ now: () => clock });
+    const session = createGroup(store, 2);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    store.approve({ sessionId: session.id, socketId: 's1', receiverId: 'r1' });
+    store.markActive({ sessionId: session.id, socketId: 's1', receiverId: 'r1' });
+    clock += 60 * 60_000;
+    expect(store.get(session.id).state).toBe(SessionState.ACTIVE);
+  });
+
+  it('a group session with only waiting receivers still expires on the TTL', () => {
+    let clock = 1_000_000;
+    const store = makeGroupStore({ now: () => clock });
+    const session = createGroup(store, 2);
+    store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r1' });
+    clock += 1001;
+    expect(store.get(session.id)).toBeUndefined();
   });
 });

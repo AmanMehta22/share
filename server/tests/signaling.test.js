@@ -404,6 +404,265 @@ describe('disconnect handling', () => {
   });
 });
 
+describe('one-to-many (group) sessions', () => {
+  async function startGroup(maxReceivers = 3) {
+    const a = await connectClient();
+    const created = await request(a, 'session:create', { code: CODE_A, mode: 'group', maxReceivers });
+    expect(created.ok).toBe(true);
+    return { a, created };
+  }
+
+  async function joinReceiver() {
+    const socket = await connectClient();
+    const response = await request(socket, 'session:join', { code: CODE_A });
+    expect(response.ok).toBe(true);
+    return { socket, receiverId: response.receiverId };
+  }
+
+  /** Resolves true if the event arrives within 200 ms, otherwise false. */
+  function expectSilence(socket, event) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        socket.off(event, onEvent);
+        resolve(false);
+      }, 200);
+      const onEvent = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      socket.once(event, onEvent);
+    });
+  }
+
+  it('creates a group session and echoes mode + maxReceivers', async () => {
+    const { a, created } = await startGroup(2);
+    expect(created.mode).toBe('group');
+    expect(created.maxReceivers).toBe(2);
+    await disconnect(a);
+  });
+
+  it('rejects an unknown mode with INVALID_MODE', async () => {
+    const a = await connectClient();
+    const response = await request(a, 'session:create', { code: CODE_A, mode: 'broadcast' });
+    expect(response.ok).toBe(false);
+    expect(response.error).toBe('INVALID_MODE');
+    await disconnect(a);
+  });
+
+  it('lets several receivers join and reports capacity in peer:joined', async () => {
+    const { a } = await startGroup(3);
+    const firstJoined = waitFor(a, 'peer:joined');
+    const r1 = await joinReceiver();
+    const joinedPayload = await firstJoined;
+    expect(joinedPayload.receiverId).toBe(r1.receiverId);
+    expect(joinedPayload.receivers).toBe(1);
+    expect(joinedPayload.maxReceivers).toBe(3);
+
+    const r2 = await joinReceiver();
+    expect(r2.receiverId).not.toBe(r1.receiverId);
+    await disconnect(a);
+    await disconnect(r1.socket);
+    await disconnect(r2.socket);
+  });
+
+  it('rejects the next join with SESSION_FULL at capacity', async () => {
+    const { a } = await startGroup(2);
+    const r1 = await joinReceiver();
+    const r2 = await joinReceiver();
+    const overflow = await connectClient();
+    const response = await request(overflow, 'session:join', { code: CODE_A });
+    expect(response.ok).toBe(false);
+    expect(response.error).toBe('SESSION_FULL');
+    await disconnect(a);
+    await disconnect(r1.socket);
+    await disconnect(r2.socket);
+    await disconnect(overflow);
+  });
+
+  it('approves one receiver by receiverId without touching the others', async () => {
+    const { a } = await startGroup(2);
+    const r1 = await joinReceiver();
+    const r2 = await joinReceiver();
+    const approvedPromise = waitFor(r1.socket, 'peer:approved');
+    const response = await request(a, 'session:approve', { receiverId: r1.receiverId });
+    expect(response.ok).toBe(true);
+    expect(response.receiverId).toBe(r1.receiverId);
+    await approvedPromise;
+    expect(await expectSilence(r2.socket, 'peer:approved')).toBe(false);
+    await disconnect(a);
+    await disconnect(r1.socket);
+    await disconnect(r2.socket);
+  });
+
+  it('approve-all approves every waiting receiver', async () => {
+    const { a } = await startGroup(3);
+    const r1 = await joinReceiver();
+    const r2 = await joinReceiver();
+    const got1 = waitFor(r1.socket, 'peer:approved');
+    const got2 = waitFor(r2.socket, 'peer:approved');
+    const response = await request(a, 'session:approve-all');
+    expect(response.ok).toBe(true);
+    expect(response.approved).toBe(2);
+    await got1;
+    await got2;
+    await disconnect(a);
+    await disconnect(r1.socket);
+    await disconnect(r2.socket);
+  });
+
+  it('routes sender signals to the chosen receiver only', async () => {
+    const { a } = await startGroup(2);
+    const r1 = await joinReceiver();
+    const r2 = await joinReceiver();
+    await request(a, 'session:approve-all');
+
+    const gotSignal = waitFor(r2.socket, 'signal');
+    const response = await request(a, 'session:signal', {
+      receiverId: r2.receiverId,
+      signal: { kind: 'offer', sdp: 'v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n' },
+    });
+    expect(response.ok).toBe(true);
+    const relayed = await gotSignal;
+    expect(relayed.from).toBe('sender');
+    // The other receiver must not see this offer.
+    expect(await expectSilence(r1.socket, 'signal')).toBe(false);
+    await disconnect(a);
+    await disconnect(r1.socket);
+    await disconnect(r2.socket);
+  });
+
+  it('tags receiver signals with peerId so the sender can route answers', async () => {
+    const { a } = await startGroup(2);
+    const r1 = await joinReceiver();
+    const r2 = await joinReceiver();
+    await request(a, 'session:approve-all');
+
+    const fromR2 = waitFor(a, 'signal');
+    await request(r2.socket, 'session:signal', { signal: { kind: 'answer', sdp: 'v=0\r\n' } });
+    const relayedR2 = await fromR2;
+    expect(relayedR2.from).toBe('receiver');
+    expect(relayedR2.peerId).toBe(r2.receiverId);
+
+    const fromR1 = waitFor(a, 'signal');
+    await request(r1.socket, 'session:signal', { signal: { kind: 'answer', sdp: 'v=0\r\n' } });
+    const relayedR1 = await fromR1;
+    expect(relayedR1.peerId).toBe(r1.receiverId);
+    await disconnect(a);
+    await disconnect(r1.socket);
+    await disconnect(r2.socket);
+  });
+
+  it('rejects a group signal without a receiverId (INVALID_TARGET)', async () => {
+    const { a } = await startGroup(2);
+    const r1 = await joinReceiver();
+    await request(a, 'session:approve', { receiverId: r1.receiverId });
+    const response = await request(a, 'session:signal', { signal: { kind: 'offer', sdp: 'v=0\r\n' } });
+    expect(response.ok).toBe(false);
+    expect(response.error).toBe('INVALID_TARGET');
+    await disconnect(a);
+    await disconnect(r1.socket);
+  });
+
+  it('a receiver cancelling in group mode only removes that receiver', async () => {
+    const { a } = await startGroup(3);
+    const r1 = await joinReceiver();
+    const r2 = await joinReceiver();
+    await request(a, 'session:approve-all');
+
+    const senderSaw = waitFor(a, 'peer:cancelled');
+    const response = await request(r2.socket, 'session:cancel', { reason: 'changed my mind' });
+    expect(response.ok).toBe(true);
+    expect(response.left).toBe(true);
+    const cancelled = await senderSaw;
+    expect(cancelled.by).toBe('receiver');
+    expect(cancelled.receiverId).toBe(r2.receiverId);
+
+    // The session is still alive: r1 can keep signaling.
+    const stillWorks = await request(a, 'session:signal', {
+      receiverId: r1.receiverId,
+      signal: { kind: 'offer', sdp: 'v=0\r\n' },
+    });
+    expect(stillWorks.ok).toBe(true);
+    await disconnect(a);
+    await disconnect(r1.socket);
+    await disconnect(r2.socket);
+  });
+
+  it('an approved receiver disconnecting mid-flow notifies the sender and the session survives', async () => {
+    const { a } = await startGroup(3);
+    const r1 = await joinReceiver();
+    const r2 = await joinReceiver();
+    await request(a, 'session:approve', { receiverId: r2.receiverId });
+
+    const disconnected = waitFor(a, 'peer:disconnected');
+    await disconnect(r2.socket);
+    const payload = await disconnected;
+    expect(payload.role).toBe('receiver');
+    expect(payload.receiverId).toBe(r2.receiverId);
+
+    // A new receiver can still join with the same code.
+    const r3 = await joinReceiver();
+    expect(r3.receiverId).not.toBe(r2.receiverId);
+    await disconnect(a);
+    await disconnect(r1.socket);
+    await disconnect(r3.socket);
+  });
+
+  it('a waiting receiver disconnecting frees only its slot (peer:waiting-again)', async () => {
+    const { a } = await startGroup(2);
+    const r1 = await joinReceiver();
+    const r2 = await joinReceiver();
+    const waitingAgain = waitFor(a, 'peer:waiting-again');
+    await disconnect(r1.socket);
+    const payload = await waitingAgain;
+    expect(payload.receiverId).toBe(r1.receiverId);
+    // r2 is untouched and can still be approved.
+    const approved = await request(a, 'session:approve', { receiverId: r2.receiverId });
+    expect(approved.ok).toBe(true);
+    await disconnect(a);
+    await disconnect(r2.socket);
+  });
+
+  it('the sender cancelling notifies every receiver', async () => {
+    const { a } = await startGroup(3);
+    const r1 = await joinReceiver();
+    const r2 = await joinReceiver();
+    const got1 = waitFor(r1.socket, 'peer:cancelled');
+    const got2 = waitFor(r2.socket, 'peer:cancelled');
+    const response = await request(a, 'session:cancel', { reason: 'sender stopped' });
+    expect(response.ok).toBe(true);
+    expect((await got1).by).toBe('sender');
+    expect((await got2).by).toBe('sender');
+    await disconnect(a);
+    await disconnect(r1.socket);
+    await disconnect(r2.socket);
+  });
+
+  it('markActive per receiver keeps the session alive for the others', async () => {
+    const { a } = await startGroup(2);
+    const r1 = await joinReceiver();
+    const r2 = await joinReceiver();
+    await request(a, 'session:approve-all');
+    const active = await request(a, 'session:active', { receiverId: r1.receiverId });
+    expect(active.ok).toBe(true);
+    // Signaling for r1 still works (active state allows it).
+    const stillWorks = await request(a, 'session:signal', {
+      receiverId: r1.receiverId,
+      signal: { kind: 'candidate', candidate: { candidate: 'candidate:1 1 udp 1 192.168.1.2 1 typ host' } },
+    });
+    expect(stillWorks.ok).toBe(true);
+    // r2 is still only approved -> also allowed.
+    const alsoWorks = await request(a, 'session:signal', {
+      receiverId: r2.receiverId,
+      signal: { kind: 'candidate', candidate: { candidate: 'candidate:2 1 udp 1 192.168.1.3 2 typ host' } },
+    });
+    expect(alsoWorks.ok).toBe(true);
+    await disconnect(a);
+    await disconnect(r1.socket);
+    await disconnect(r2.socket);
+  });
+});
+
 describe('validation of signal payloads (unit)', () => {
   it('accepts a minimal valid offer', async () => {
     const { validateSignalPayload } = await import('../src/services/signaling.js');

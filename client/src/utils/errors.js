@@ -46,7 +46,22 @@ const HINTS = Object.freeze({
   },
   RECEIVER_TAKEN: {
     title: 'Already connected',
-    hint: 'This transfer already has a receiver. Only one receiver is supported.',
+    hint: 'This is a one-to-one transfer and it already has a receiver. Ask the sender to start a "one to many" transfer instead.',
+    retryable: false,
+  },
+  SESSION_FULL: {
+    title: 'Group is full',
+    hint: 'Every slot for this one-to-many transfer is taken. Ask the sender for a new code, or wait until a receiver drops out.',
+    retryable: true,
+  },
+  INVALID_MODE: {
+    title: 'Unknown transfer mode',
+    hint: 'The sender chose a mode this server does not understand. Reload the page and try again.',
+    retryable: false,
+  },
+  INVALID_TARGET: {
+    title: 'Missing receiver',
+    hint: 'The transfer could not say which receiver a message belongs to. Reload the sender page and try again.',
     retryable: false,
   },
   RATE_LIMITED: {

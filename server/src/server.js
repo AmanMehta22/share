@@ -16,6 +16,7 @@ export function createNodeServer({ config, logger = createLogger({ level: 'warn'
     ttlMs: config.sessionTtlMs,
     maxJoinAttempts: config.maxJoinAttempts,
     maxSessionsPerIp: config.maxSessionsPerIp,
+    maxReceiversPerSession: config.maxReceivers,
   });
 
   const app = createApp({ config, store });

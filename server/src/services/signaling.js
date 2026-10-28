@@ -1,6 +1,6 @@
 import { isValidCode, normalizeCode, hashCode, logRef } from '../utils/code.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
-import { SessionError, SessionState } from './sessionStore.js';
+import { SessionError, SessionMode, ReceiverState } from './sessionStore.js';
 
 /**
  * Socket.IO signaling: the ONLY traffic that leaves the browser on its way to
@@ -8,6 +8,12 @@ import { SessionError, SessionState } from './sessionStore.js';
  *
  * It carries: transfer codes (hashed on arrival), SDP offers/answers and ICE
  * candidates. It NEVER carries file bytes, filenames or transfer progress.
+ *
+ * Two send modes are served here:
+ *  - direct: one sender, one receiver (original flow)
+ *  - group:  one sender, up to maxReceivers receivers; every relayed signal is
+ *    routed per receiver via receiverId / peerId so each receiver gets its own
+ *    independent WebRTC connection.
  */
 
 const MAX_SDP_CHARS = 100_000;
@@ -71,10 +77,16 @@ export function attachSignaling(io, { store, config, logger }) {
   });
   const createLimiter = createRateLimiter({ points: 20, windowMs: 60_000 });
 
-  // When the sweeper expires a session, tell both peers instead of leaving
-  // their tabs stuck on a code that can never be used again.
+  const emitTo = (socketId, event, data) => {
+    if (!socketId) return;
+    const target = io.sockets.sockets.get(socketId);
+    if (target) target.emit(event, data);
+  };
+
+  // When the sweeper expires a session, tell every participant instead of
+  // leaving their tabs stuck on a code that can never be used again.
   store.onExpire = (expired, reason) => {
-    for (const socketId of [expired.senderSocketId, expired.receiverSocketId]) {
+    for (const socketId of [expired.senderSocketId, ...expired.receivers.keys()]) {
       if (!socketId) continue;
       const socket = io.sockets.sockets.get(socketId);
       if (!socket) continue;
@@ -131,16 +143,6 @@ export function attachSignaling(io, { store, config, logger }) {
       socket.data.codeHash = null;
     };
 
-    const notifyPeer = (event, data) => {
-      const current = session();
-      if (!current) return;
-      const peerId =
-        current.senderSocketId === socket.id ? current.receiverSocketId : current.senderSocketId;
-      if (!peerId) return;
-      const peer = io.sockets.sockets.get(peerId);
-      if (peer) peer.emit(event, data);
-    };
-
     // ---------------------------------------------------------------- create
     handle(
       'session:create',
@@ -155,18 +157,37 @@ export function attachSignaling(io, { store, config, logger }) {
         if (!code || !isValidCode(code)) {
           return fail('INVALID_CODE', 'Invalid transfer code format.');
         }
+        const modeRaw = payload && payload.mode;
+        let mode;
+        if (modeRaw === undefined || modeRaw === SessionMode.DIRECT) mode = SessionMode.DIRECT;
+        else if (modeRaw === SessionMode.GROUP) mode = SessionMode.GROUP;
+        else return fail('INVALID_MODE', 'Unknown transfer mode. Use "direct" or "group".');
+
         const codeHash = hashCode(code);
         const created = store.create({
           codeHash,
           ip,
           senderSocketId: socket.id,
           ttlMs: config.sessionTtlMs,
+          mode,
+          maxReceivers: payload && payload.maxReceivers,
         });
         socket.data.role = 'sender';
         socket.data.sessionId = created.id;
         socket.data.codeHash = codeHash;
-        logger.info('session created', { session: created.id, ref: logRef(codeHash), expiresAt: created.expiresAt });
-        return ok({ sessionId: created.id, expiresAt: created.expiresAt });
+        logger.info('session created', {
+          session: created.id,
+          ref: logRef(codeHash),
+          mode: created.mode,
+          maxReceivers: created.maxReceivers,
+          expiresAt: created.expiresAt,
+        });
+        return ok({
+          sessionId: created.id,
+          expiresAt: created.expiresAt,
+          mode: created.mode,
+          maxReceivers: created.maxReceivers,
+        });
       },
       createLimiter
     );
@@ -193,26 +214,80 @@ export function attachSignaling(io, { store, config, logger }) {
         detachFromSession();
         return fail('SENDER_GONE', 'The sender is no longer online. Ask them for a new code.');
       }
-      sender.emit('peer:joined', { receiverId: socket.id, state: joined.state });
-      logger.info('receiver joined', { session: joined.id, ref: logRef(codeHash) });
-      return ok({ sessionId: joined.id, expiresAt: joined.expiresAt, senderOnline: true });
+      sender.emit('peer:joined', {
+        receiverId: socket.id,
+        state: joined.state,
+        receivers: joined.receivers.size,
+        maxReceivers: joined.maxReceivers,
+      });
+      logger.info('receiver joined', {
+        session: joined.id,
+        ref: logRef(codeHash),
+        receivers: joined.receivers.size,
+      });
+      return ok({
+        sessionId: joined.id,
+        expiresAt: joined.expiresAt,
+        senderOnline: true,
+        receiverId: socket.id,
+        mode: joined.mode,
+      });
     });
 
     // -------------------------------------------------------------- approve
-    handle('session:approve', () => {
+    handle('session:approve', (payload) => {
       const current = session();
       if (!current) return fail('NO_SESSION', 'No active transfer session.');
       if (socket.data.role !== 'sender') return fail('FORBIDDEN', 'Only the sender can approve.');
-      const receiverId = store.approve({ sessionId: current.id, socketId: socket.id });
-      const receiver = io.sockets.sockets.get(receiverId);
+      const receiverId = typeof (payload && payload.receiverId) === 'string' ? payload.receiverId : null;
+
+      let approvedId;
+      try {
+        approvedId = store.approve({ sessionId: current.id, socketId: socket.id, receiverId });
+      } catch (error) {
+        // A group receiver may have dropped between join and approval; report
+        // it without tearing down the whole group session.
+        if (error instanceof SessionError && error.code === 'RECEIVER_GONE' && current.mode === SessionMode.GROUP) {
+          return fail('RECEIVER_GONE', error.message);
+        }
+        throw error;
+      }
+
+      const receiver = io.sockets.sockets.get(approvedId);
       if (!receiver) {
+        store.removeReceiver({ sessionId: current.id, socketId: approvedId });
+        if (current.mode === SessionMode.GROUP) {
+          emitTo(current.senderSocketId, 'peer:disconnected', { role: 'receiver', receiverId: approvedId });
+          return fail('RECEIVER_GONE', 'The receiver disconnected before approval.');
+        }
         store.close({ sessionId: current.id, reason: 'receiver_gone' });
         detachFromSession();
         return fail('RECEIVER_GONE', 'The receiver disconnected. Share the code again.');
       }
       receiver.emit('peer:approved', { senderId: socket.id });
-      logger.info('receiver approved', { session: current.id });
-      return ok({ approved: true });
+      logger.info('receiver approved', { session: current.id, receiver: logRef(approvedId) });
+      return ok({ approved: true, receiverId: approvedId });
+    });
+
+    // ----------------------------------------------------------- approve all
+    handle('session:approve-all', () => {
+      const current = session();
+      if (!current) return fail('NO_SESSION', 'No active transfer session.');
+      if (socket.data.role !== 'sender') return fail('FORBIDDEN', 'Only the sender can approve receivers.');
+      const approvedIds = store.approveAll({ sessionId: current.id, socketId: socket.id });
+      let live = 0;
+      for (const receiverId of approvedIds) {
+        const receiver = io.sockets.sockets.get(receiverId);
+        if (!receiver) {
+          store.removeReceiver({ sessionId: current.id, socketId: receiverId });
+          emitTo(current.senderSocketId, 'peer:disconnected', { role: 'receiver', receiverId });
+          continue;
+        }
+        receiver.emit('peer:approved', { senderId: socket.id });
+        live += 1;
+      }
+      logger.info('all receivers approved', { session: current.id, approved: live });
+      return ok({ approved: live });
     });
 
     // --------------------------------------------------------------- reject
@@ -222,43 +297,62 @@ export function attachSignaling(io, { store, config, logger }) {
       if (socket.data.role !== 'sender') return fail('FORBIDDEN', 'Only the sender can reject.');
       const reason =
         typeof (payload && payload.reason) === 'string' ? payload.reason.slice(0, 200) : 'rejected_by_sender';
-      const receiverId = store.rejectReceiver({ sessionId: current.id, socketId: socket.id });
-      if (receiverId) {
-        const receiver = io.sockets.sockets.get(receiverId);
-        if (receiver) receiver.emit('peer:rejected', { reason });
+      const receiverId = typeof (payload && payload.receiverId) === 'string' ? payload.receiverId : null;
+      const rejectedIds = store.rejectReceiver({ sessionId: current.id, socketId: socket.id, receiverId });
+      for (const id of rejectedIds) emitTo(id, 'peer:rejected', { reason });
+      if (current.mode === SessionMode.DIRECT) {
+        // A direct transfer is over once its only receiver is declined.
+        store.close({ sessionId: current.id, reason: 'sender_rejected' });
+        detachFromSession();
       }
-      detachFromSession();
-      logger.info('receiver rejected', { session: current.id });
-      return ok();
+      logger.info('receiver(s) rejected', { session: current.id, rejected: rejectedIds.length });
+      return ok({ rejected: rejectedIds.length });
     });
 
     // --------------------------------------------------------------- signal
     handle('session:signal', (payload) => {
       const current = session();
       if (!current) return fail('NO_SESSION', 'No active transfer session.');
-      if (current.state !== SessionState.APPROVED && current.state !== SessionState.ACTIVE) {
-        return fail('INVALID_STATE', 'Signaling is not allowed until the sender approves the receiver.');
-      }
-      const isSender = current.senderSocketId === socket.id;
-      const isReceiver = current.receiverSocketId === socket.id;
-      if (!isSender && !isReceiver) return fail('FORBIDDEN', 'You are not a member of this session.');
-
       const check = validateSignalPayload(payload && payload.signal);
       if (!check.valid) return fail('INVALID_SIGNAL', check.reason);
 
-      const peerId = isSender ? current.receiverSocketId : current.senderSocketId;
-      const peer = peerId ? io.sockets.sockets.get(peerId) : undefined;
-      if (!peer) return fail('PEER_GONE', 'The other participant is no longer connected.');
+      const isSender = current.senderSocketId === socket.id;
+      const maySignal = (receiver) =>
+        receiver && (receiver.state === ReceiverState.APPROVED || receiver.state === ReceiverState.ACTIVE);
 
-      peer.emit('signal', { signal: payload.signal, from: isSender ? 'sender' : 'receiver' });
+      if (isSender) {
+        const receiverId = payload && payload.receiverId;
+        if (current.mode === SessionMode.GROUP && typeof receiverId !== 'string') {
+          return fail('INVALID_TARGET', 'Group transfers must say which receiver this signal is for.');
+        }
+        const receiver =
+          typeof receiverId === 'string' ? current.receivers.get(receiverId) : [...current.receivers.values()][0];
+        if (!maySignal(receiver)) {
+          return fail('INVALID_STATE', 'Signaling is not allowed until the sender approves the receiver.');
+        }
+        const peer = io.sockets.sockets.get(receiver.id);
+        if (!peer) return fail('PEER_GONE', 'The other participant is no longer connected.');
+        peer.emit('signal', { signal: payload.signal, from: 'sender', peerId: socket.id });
+        return ok();
+      }
+
+      const receiver = current.receivers.get(socket.id);
+      if (!receiver) return fail('FORBIDDEN', 'You are not a member of this session.');
+      if (!maySignal(receiver)) {
+        return fail('INVALID_STATE', 'Signaling is not allowed until the sender approves the receiver.');
+      }
+      const peer = io.sockets.sockets.get(current.senderSocketId);
+      if (!peer) return fail('PEER_GONE', 'The other participant is no longer connected.');
+      peer.emit('signal', { signal: payload.signal, from: 'receiver', peerId: socket.id });
       return ok();
     });
 
     // --------------------------------------------------------------- active
-    handle('session:active', () => {
+    handle('session:active', (payload) => {
       const current = session();
       if (!current) return fail('NO_SESSION', 'No active transfer session.');
-      store.markActive({ sessionId: current.id, socketId: socket.id });
+      const receiverId = typeof (payload && payload.receiverId) === 'string' ? payload.receiverId : null;
+      store.markActive({ sessionId: current.id, socketId: socket.id, receiverId });
       return ok();
     });
 
@@ -270,14 +364,34 @@ export function attachSignaling(io, { store, config, logger }) {
         return ok({ alreadyClosed: true });
       }
       const isSender = current.senderSocketId === socket.id;
-      const isReceiver = current.receiverSocketId === socket.id;
+      const isReceiver = current.receivers.has(socket.id);
       if (!isSender && !isReceiver) return fail('FORBIDDEN', 'You are not a member of this session.');
       const reason =
         typeof (payload && payload.reason) === 'string' ? payload.reason.slice(0, 200) : 'cancelled';
-      notifyPeer('peer:cancelled', { reason, by: isSender ? 'sender' : 'receiver' });
+
+      if (isSender) {
+        for (const receiverId of current.receivers.keys()) {
+          emitTo(receiverId, 'peer:cancelled', { reason, by: 'sender' });
+        }
+        store.close({ sessionId: current.id, reason });
+        detachFromSession();
+        logger.info('session cancelled', { session: current.id, by: 'sender' });
+        return ok();
+      }
+
+      // Receiver cancelling: in group mode only this receiver leaves; the
+      // sender keeps the session for everyone else.
+      if (current.mode === SessionMode.GROUP) {
+        store.removeReceiver({ sessionId: current.id, socketId: socket.id });
+        emitTo(current.senderSocketId, 'peer:cancelled', { reason, by: 'receiver', receiverId: socket.id });
+        detachFromSession();
+        logger.info('receiver left group', { session: current.id });
+        return ok({ left: true });
+      }
+      emitTo(current.senderSocketId, 'peer:cancelled', { reason, by: 'receiver', receiverId: socket.id });
       store.close({ sessionId: current.id, reason });
       detachFromSession();
-      logger.info('session cancelled', { session: current.id, by: isSender ? 'sender' : 'receiver' });
+      logger.info('session cancelled', { session: current.id, by: 'receiver' });
       return ok();
     });
 
@@ -296,8 +410,11 @@ export function attachSignaling(io, { store, config, logger }) {
       }
 
       if (role === 'sender') {
+        const receiverIds = [...current.receivers.keys()];
         store.close({ sessionId, reason: `sender_${reason}` });
-        notifyPeerBeforeClose('peer:disconnected', { role: 'sender', reason });
+        for (const receiverId of receiverIds) {
+          emitTo(receiverId, 'peer:disconnected', { role: 'sender', reason });
+        }
         detachFromSession();
         return;
       }
@@ -305,21 +422,36 @@ export function attachSignaling(io, { store, config, logger }) {
       // Receiver: allow a clean re-join (page refresh) while still waiting.
       const released = store.releaseReceiver({ sessionId, socketId: socket.id });
       if (released) {
-        notifyPeerBeforeClose('peer:waiting-again', { role: 'receiver', reason });
-      } else {
-        store.close({ sessionId, reason: `receiver_${reason}` });
-        notifyPeerBeforeClose('peer:disconnected', { role: 'receiver', reason });
+        emitTo(current.senderSocketId, 'peer:waiting-again', {
+          role: 'receiver',
+          receiverId: socket.id,
+          reason,
+        });
+        detachFromSession();
+        return;
       }
-      detachFromSession();
-    }
 
-    function notifyPeerBeforeClose(event, data) {
-      const stored = store.sessions.get(socket.data.sessionId);
-      if (!stored) return;
-      const peerId = stored.senderSocketId === socket.id ? stored.receiverSocketId : stored.senderSocketId;
-      if (!peerId) return;
-      const peer = io.sockets.sockets.get(peerId);
-      if (peer) peer.emit(event, data);
+      if (current.mode === SessionMode.GROUP) {
+        // One receiver of many dropped mid-flow: drop just them and keep the
+        // session (and every other transfer) alive.
+        store.removeReceiver({ sessionId, socketId: socket.id });
+        emitTo(current.senderSocketId, 'peer:disconnected', {
+          role: 'receiver',
+          receiverId: socket.id,
+          reason,
+        });
+        detachFromSession();
+        return;
+      }
+
+      // Direct mode: the only receiver is gone, so the session is over.
+      store.close({ sessionId, reason: `receiver_${reason}` });
+      emitTo(current.senderSocketId, 'peer:disconnected', {
+        role: 'receiver',
+        receiverId: socket.id,
+        reason,
+      });
+      detachFromSession();
     }
 
     socket.on('disconnect', (reason) => {
@@ -333,3 +465,4 @@ export function attachSignaling(io, { store, config, logger }) {
     });
   });
 }
+

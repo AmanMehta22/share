@@ -2,10 +2,18 @@
 
 **Free, code-based peer-to-peer file transfer. No accounts, no storage, no paid services.**
 
-CodeShare moves files and folders directly between two computers. One side picks files and gets a
+CodeShare moves files and folders directly between computers. One side picks files and gets a
 one-time code like `ABCD-EFGH-JKMN-PQRS`; the other side types that code, reviews the file list, and
 accepts. The bytes then travel **browser to browser over WebRTC** — they are never uploaded to any
 server.
+
+Two send modes are built in:
+
+- **One to one** — exactly one receiver joins the code (the classic flow).
+- **One to many** — up to a chosen number of receivers (2/3/5/10) join with the *same* code; each
+  gets their own independent, encrypted peer connection and their own consent gate. The sender
+  approves receivers one by one or all at once, watches per-receiver progress, and sees an honest
+  per-receiver outcome summary at the end.
 
 - **₹0 / $0 cost** — no paid storage, no database, no TURN service, no domain, no API keys, no OTP
   emails or SMS. Nothing in this project can generate a charge.
@@ -63,7 +71,8 @@ server.
 │  · validates codes (SHA-256 hashed,          │          │
 │    15-min TTL, single use)                   │          │
 │  · relays SDP offers/answers + ICE candidates│          │
-│  · strict 1:1 session membership             │          │
+│  · routes signals per receiver (1:1 or 1:N)  │          │
+│  · rate limits + join-attempt caps           │          │
 │  · rate limits + join-attempt caps           │          │
 │                                              │          │
 │  ✗ has NO route that accepts file uploads    │          │
@@ -104,12 +113,16 @@ codeshare/
    4 groups: `XXXX-XXXX-XXXX-XXXX`. That is ~79 bits of entropy (requirement: ≥ 40). The alphabet
    excludes I, L, O, 0, 1 so codes can be read aloud without confusion.
 2. **Signaling handshake.** The sender's browser asks the server to register the code (stored only
-   as a SHA-256 hash). The receiver types the code; the server checks it, enforces single-use and
-   1:1 membership, and tells the sender someone joined. The **sender must approve** before anything
-   else happens.
-3. **SDP offer/answer.** The sender creates an `RTCPeerConnection` with a data channel, produces an
-   SDP offer; the receiver produces an SDP answer. Both are relayed through the signaling server,
-   which validates and size-caps them but does not interpret them.
+   as a SHA-256 hash). Receivers type the code; the server checks it, enforces the membership limit
+   (exactly one receiver in one-to-one mode, up to the chosen group size in one-to-many mode), and
+   tells the sender someone joined. The **sender must approve** each receiver before anything else
+   happens. In group mode every SDP/ICE signal is tagged with the receiving socket so each browser
+   gets only its own connection handshake.
+3. **SDP offer/answer.** For each approved receiver the sender creates its own
+   `RTCPeerConnection` with a data channel and produces an SDP offer; that receiver produces an
+   SDP answer. Both are relayed through the signaling server, which validates and size-caps them
+   but does not interpret them. A group transfer is therefore N independent WebRTC connections —
+   there is no relay between receivers.
 4. **ICE + STUN.** Each browser asks free public STUN servers what its public address looks like,
    gathers candidate network paths (host, server-reflexive), and trickles them through the server.
    The two browsers then race the candidates to find a direct route.
@@ -146,15 +159,26 @@ rather than falling back to a paid relay. See
 
 ## Workflows
 
-**Sender:** drag-drop files/folder (or browse) → validate → *Generate transfer code* → share the
-code → approve the receiver when they join → watch real progress/speed/ETA → pause/resume/cancel
-anytime → success only after the receiver's verified ack → *Send another transfer* without
-refreshing.
+**Sender (one to one):** drag-drop files/folder (or browse) → validate → pick *One to one* →
+*Generate transfer code* → share the code → approve the receiver when they join → watch real
+progress/speed/ETA → pause/resume/cancel anytime → success only after the receiver's verified ack →
+*Send another transfer* without refreshing.
+
+**Sender (one to many):** same start, but pick *One to many* and a group size (2/3/5/10). Receivers
+join one after another with the same code and appear as rows; approve each individually or click
+*Approve all*. Each approved receiver gets its own WebRTC connection and its own consent prompt;
+progress is shown per receiver plus aggregate speed/ETA. Pause/resume/cancel act on the whole group
+(the sender cannot half-cancel a session honestly — cancelling ends it for everyone). Receivers who
+leave before approval free their slot; late joiners can still be approved while others transfer. The
+end screen summarizes every receiver's real outcome (received ✓, declined, cancelled, failed) —
+never a blanket "success".
 
 **Receiver:** enter the code (normalization handles lowercase, spaces, dots, pasted messiness) →
 wait for sender approval → review the incoming file list and total size → pick a save mode →
 *Accept & receive* → real progress, pause/resume/cancel → files written by your own browser →
-success/rollback screen → *Receive another transfer*.
+success/rollback screen → *Receive another transfer*. The receiver screen is identical in both
+modes — a group receiver cannot tell (and does not need to know) that others are receiving the same
+files.
 
 Both sides detect disconnects, expired codes, rejects, and channel errors, and always end on an
 explicit success / cancelled / failed screen — never a fake progress bar or a false "done".
@@ -230,20 +254,23 @@ Individual scripts (from the repo root):
 npm test
 ```
 
-- **Server (85 tests):** code normalization/validation, SHA-256 hashing (never raw codes), session
-  lifecycle (create → join → approve → active → close), 1:1 membership, duplicate receivers,
-  sender-only approve/active, TTL expiry with ACTIVE-transfer exemption, sweeper + tombstones,
-  per-IP join-attempt caps, and 26 **integration tests over real loopback sockets** exercising the
-  full Socket.IO contract (acks, `peer:*` events, signal relay, malformed/oversized payload
-  rejection, disconnect handling).
-- **Client (108 tests):** code generation (entropy, rejection sampling, no excluded characters),
+- **Server (116 tests):** code normalization/validation, SHA-256 hashing (never raw codes), session
+  lifecycle (create → join → approve → active → close), 1:1 and 1:N membership with capacity caps
+  (SESSION_FULL), per-receiver approve / approve-all / reject / markActive, aggregate session
+  states, sender-only authorization, TTL expiry with ACTIVE-transfer exemption, sweeper +
+  tombstones, per-IP join-attempt caps, and 38 **integration tests over real loopback sockets**
+  exercising the full Socket.IO contract (acks, `peer:*` events with receiverId routing, per-peer
+  signal relay, malformed/oversized payload rejection, group cancel/disconnect semantics).
+- **Client (120 tests):** code generation (entropy, rejection sampling, no excluded characters),
   path sanitization (traversal, NULs, reserved names, dedupe), the ZIP writer (CRC32 vectors,
   archive structure, round-trip bytes, unsafe-path rejection), the binary protocol (frame
-  encode/decode, manifest validation, oversized/unknown frames), and the **transfer engines over a
+  encode/decode, manifest validation, oversized/unknown frames), the **transfer engines over a
   fake in-memory data channel**: happy paths, multi-file, directory entries, byte-for-byte
   integrity, binary-only frames, consent gating, reject, pause/resume, cancel from both sides,
   peer disconnect, out-of-order/size-mismatch detection, streaming folder writer with abort,
-  backpressure, zero-byte files.
+  backpressure, zero-byte files, and the **group orchestrator**: parallel receivers with
+  independent outcomes (one rejects / drops / cancels without corrupting the others), pause-all /
+  resume-all / cancel-all, and honest per-receiver summaries.
 
 These verify everything that does not require two real browsers with real WebRTC.
 
@@ -260,6 +287,17 @@ WebRTC peer connections need real browsers; that part is verified by hand:
 5. Verify: real progress on both sides, pause/resume works, and the received files match the
    originals (compare sizes/hashes). Try a >100 MB file to confirm backpressure and speed display.
 
+**Two windows, one computer — one-to-many mode:**
+1. Window A → *Send files* → drop a folder → pick *One to many*, group size 2 → *Generate transfer
+   code*.
+2. Windows B and C → *Receive files* → both type the same code → *Connect*.
+3. Window A shows both receivers as rows → approve one, then *Approve all* for the rest.
+4. B and C each review the file list and accept independently (one can accept while the other
+   still reads the list).
+5. Verify: per-receiver progress rows on A, real transfer on B and C, files identical on both.
+6. Kill window C mid-transfer → A marks only C failed; B must finish normally and A's final screen
+   must show B ✓ / C failed.
+
 **Two computers (LAN):** same steps; open `http://<sender-LAN-IP>:5173` (or :4000 in production
 mode) on the receiver. Both machines must be able to reach the signaling server.
 
@@ -270,8 +308,10 @@ that is the documented NAT limitation, not a bug.
 
 **Also verify manually:** rejecting a transfer, cancelling mid-transfer on each side, closing a tab
 mid-transfer (peer must show a disconnect error), code expiry after 15 minutes, reusing a spent
-code (must fail), and folder-save on a Chromium browser (File System Access API) plus ZIP fallback
-on Firefox/Safari.
+code (must fail), folder-save on a Chromium browser (File System Access API) plus ZIP fallback
+on Firefox/Safari, and in group mode: a receiver leaving before approval (slot frees up, others
+unaffected), declining one receiver while approving another, and a receiver trying to join a group
+that is already full (clear SESSION_FULL message).
 
 ## Free hosting
 
@@ -369,7 +409,9 @@ and by the network route, not by CodeShare.
   only as SHA-256 hashes; logs reference sessions by hash prefix only.
 - **Consent:** the sender approves the receiver, and the receiver sees the full file list and size
   before any byte is read from the sender's disk.
-- **Server hardening:** strict 1:1 session membership, per-IP join-attempt caps and signal rate
+- **Server hardening:** bounded session membership (exactly one receiver in direct mode, at most
+  the sender's chosen group size — itself capped by `MAX_RECEIVERS` — in group mode), per-IP
+  join-attempt caps and signal rate
   limits, payload validation and size caps on every signaling message, minimal security headers,
   CORS restricted to the configured client origin.
 - **Receiver-side safety:** all incoming paths are sanitized (no `..`, absolute paths, drive
@@ -402,6 +444,7 @@ and by the network route, not by CodeShare.
 | `SESSION_TTL_MINUTES` | `15` | Minutes before an unused code expires |
 | `MAX_JOIN_ATTEMPTS` | `5` | Failed joins per IP per code before that IP is blocked |
 | `MAX_SESSIONS_PER_IP` | `10` | Live sessions one IP may hold |
+| `MAX_RECEIVERS` | `10` | Hard server-side cap on receivers per one-to-many transfer |
 | `MAX_SIGNALS_PER_MINUTE` | `600` | Signaling events per socket per minute |
 | `TRUST_PROXY` | `0` | Set `1` only behind a reverse proxy (uses X-Forwarded-For for rate-limit keys) |
 | `SERVE_CLIENT` | `1` | Serve `client/dist` from this server (single-host mode) |
@@ -447,14 +490,17 @@ you** — no third-party APIs, no metered relay, no storage service.
 
 ## What is tested automatically vs. manually
 
-**Automatically verified by `npm test` (193 tests):**
-code generation entropy & normalization; invalid/expired/unknown codes; duplicate receivers; session
-TTL expiry (with ACTIVE exemption); sender approve/reject; signaling validation (all message types,
+**Automatically verified by `npm test` (236 tests):**
+code generation entropy & normalization; invalid/expired/unknown codes; duplicate receivers and
+group capacity limits (SESSION_FULL); session TTL expiry (with ACTIVE exemption); sender
+approve/reject including per-receiver and approve-all; group signal routing by receiverId/peerId;
+one receiver leaving without killing the group session; signaling validation (all message types,
 malformed and oversized payloads); unauthorized signaling; disconnect handling and cleanup; rate
 limits and repeated invalid join attempts; binary frame codec; manifest validation; chunk ordering,
 size verification and integrity; multi-file and zero-byte transfers; pause/resume/cancel from both
 sides; consent gating; streaming writer with abort-on-cancel; backpressure; ZIP writer CRC and
-structure; path traversal prevention.
+structure; path traversal prevention; and the group orchestrator (parallel receivers, mixed
+outcomes, pause/resume/cancel-all, honest per-receiver summaries).
 
 **Requires manual two-computer testing (cannot be automated in Node):**
 real browser-to-browser WebRTC connection across real NATs; actual DTLS encryption end-to-end;

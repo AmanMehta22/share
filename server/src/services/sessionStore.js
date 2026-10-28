@@ -11,14 +11,38 @@ import { randomUUID } from 'node:crypto';
  *    sessions). For multiple instances you would need a shared store such as
  *    Redis - which is deliberately NOT added, to keep the project at Rs 0.
  *  - Sessions are keyed by SHA-256(code), never by the raw code.
+ *
+ * Two send modes are supported:
+ *  - direct: exactly one receiver (the original one-to-one flow)
+ *  - group:  one sender, up to `maxReceivers` receivers, each with its own
+ *            independent WebRTC peer connection
+ *
+ * In both modes every receiver has its own record in `session.receivers`; the
+ * direct mode simply clamps maxReceivers to 1. The aggregate `session.state`
+ * is derived from the per-receiver states:
+ *    any active receiver   -> ACTIVE
+ *    else any approved     -> APPROVED
+ *    else any waiting      -> PAIRED
+ *    else                  -> WAITING
  */
 
 export const SessionState = Object.freeze({
   WAITING: 'waiting', // sender created the code, nobody joined yet
-  PAIRED: 'paired', // receiver joined, waiting for sender approval
-  APPROVED: 'approved', // sender approved, WebRTC negotiation may start
-  ACTIVE: 'active', // data channel open, transfer in progress
+  PAIRED: 'paired', // at least one receiver joined, waiting for sender approval
+  APPROVED: 'approved', // at least one receiver approved, WebRTC negotiation may start
+  ACTIVE: 'active', // at least one data channel is open, transfer in progress
   CLOSED: 'closed',
+});
+
+export const ReceiverState = Object.freeze({
+  WAITING: 'waiting', // joined, not yet approved
+  APPROVED: 'approved', // sender approved; signaling + WebRTC allowed
+  ACTIVE: 'active', // data channel open with this receiver
+});
+
+export const SessionMode = Object.freeze({
+  DIRECT: 'direct',
+  GROUP: 'group',
 });
 
 const TERMINAL_STATES = new Set([SessionState.CLOSED]);
@@ -34,14 +58,24 @@ export class SessionError extends Error {
 
 export class SessionStore {
   /**
-   * @param {{ttlMs?:number, maxJoinAttempts?:number, maxSessionsPerIp?:number, now?:() => number}} [options]
+   * @param {{ttlMs?:number, maxJoinAttempts?:number, maxSessionsPerIp?:number, maxReceiversPerSession?:number, now?:() => number}} [options]
    */
   constructor(options = {}) {
-    const { ttlMs = 15 * 60_000, maxJoinAttempts = 5, maxSessionsPerIp = 10, now = () => Date.now() } = options;
+    const {
+      ttlMs = 15 * 60_000,
+      maxJoinAttempts = 5,
+      maxSessionsPerIp = 10,
+      maxReceiversPerSession = 10,
+      now = () => Date.now(),
+    } = options;
     if (!Number.isFinite(ttlMs) || ttlMs < 1000) throw new Error('ttlMs must be >= 1000');
+    if (!Number.isInteger(maxReceiversPerSession) || maxReceiversPerSession < 1) {
+      throw new Error('maxReceiversPerSession must be a positive integer');
+    }
     this.ttlMs = ttlMs;
     this.maxJoinAttempts = maxJoinAttempts;
     this.maxSessionsPerIp = maxSessionsPerIp;
+    this.maxReceiversPerSession = maxReceiversPerSession;
     this.now = now;
 
     /** @type {Map<string, object>} */
@@ -102,16 +136,44 @@ export class SessionStore {
     return session;
   }
 
+  /** Derive the aggregate session state from the per-receiver states. */
+  #syncState(session) {
+    let next = SessionState.WAITING;
+    for (const receiver of session.receivers.values()) {
+      if (receiver.state === ReceiverState.ACTIVE) {
+        next = SessionState.ACTIVE;
+        break;
+      }
+      if (receiver.state === ReceiverState.APPROVED) next = SessionState.APPROVED;
+      else if (receiver.state === ReceiverState.WAITING && next !== SessionState.APPROVED) {
+        next = SessionState.PAIRED;
+      }
+    }
+    session.state = next;
+    session.updatedAt = this.now();
+    return session;
+  }
+
+  /** Clamp a requested group size to this store's hard cap. */
+  #clampMaxReceivers(requested) {
+    const value = Number.parseInt(String(requested), 10);
+    if (!Number.isInteger(value)) return this.maxReceiversPerSession;
+    return Math.min(Math.max(value, 1), this.maxReceiversPerSession);
+  }
+
   /**
    * Create a new session for a sender.
-   * @param {{codeHash:string, ip:string, senderSocketId:string, ttlMs?:number}} params
+   * @param {{codeHash:string, ip:string, senderSocketId:string, ttlMs?:number, mode?:string, maxReceivers?:number}} params
    */
-  create({ codeHash, ip, senderSocketId, ttlMs }) {
+  create({ codeHash, ip, senderSocketId, ttlMs, mode = SessionMode.DIRECT, maxReceivers }) {
     if (typeof codeHash !== 'string' || codeHash.length < 32) {
       throw new SessionError('INVALID_CODE', 'Invalid transfer code.');
     }
     if (typeof senderSocketId !== 'string' || !senderSocketId) {
       throw new SessionError('INVALID_SOCKET', 'Missing connection identity.');
+    }
+    if (mode !== SessionMode.DIRECT && mode !== SessionMode.GROUP) {
+      throw new SessionError('INVALID_MODE', 'Unknown transfer mode. Use "direct" or "group".');
     }
 
     const existingId = this.byCodeHash.get(codeHash);
@@ -140,8 +202,12 @@ export class SessionStore {
       codeHash,
       ip,
       state: SessionState.WAITING,
+      mode,
+      // Direct mode is always exactly one receiver; group mode is capped.
+      maxReceivers: mode === SessionMode.GROUP ? this.#clampMaxReceivers(maxReceivers) : 1,
       senderSocketId,
-      receiverSocketId: null,
+      /** @type {Map<string, {id:string, state:string, joinedAt:number, approvedAt:number|null, activatedAt:number|null}>} */
+      receivers: new Map(),
       createdAt: currentTime,
       updatedAt: currentTime,
       expiresAt: currentTime + (ttlMs ?? this.ttlMs),
@@ -170,6 +236,12 @@ export class SessionStore {
     return sessionId ? this.get(sessionId) : undefined;
   }
 
+  /** Look up one receiver record of a session (raw; ignores expiry). */
+  getReceiver(session, receiverId) {
+    if (!session || typeof receiverId !== 'string') return undefined;
+    return session.receivers.get(receiverId);
+  }
+
   /**
    * A receiver attempts to join a session by code hash.
    * @param {{codeHash:string, ip:string, receiverSocketId:string}} params
@@ -187,65 +259,151 @@ export class SessionStore {
         'Transfer code not found. It may be wrong, already used, or expired.'
       );
     }
-    if (session.receiverSocketId) {
+    if (session.receivers.size >= session.maxReceivers) {
       this.#recordFailedJoin(ip, codeHash);
-      throw new SessionError('RECEIVER_TAKEN', 'This transfer already has a receiver connected.');
+      if (session.mode === SessionMode.DIRECT) {
+        throw new SessionError('RECEIVER_TAKEN', 'This transfer already has a receiver connected.');
+      }
+      throw new SessionError(
+        'SESSION_FULL',
+        `This one-to-many transfer already has its maximum of ${session.maxReceivers} receivers.`
+      );
     }
 
-    session.receiverSocketId = receiverSocketId;
-    session.state = SessionState.PAIRED;
-    session.updatedAt = this.now();
+    session.receivers.set(receiverSocketId, {
+      id: receiverSocketId,
+      state: ReceiverState.WAITING,
+      joinedAt: this.now(),
+      approvedAt: null,
+      activatedAt: null,
+    });
+    this.#syncState(session);
     return session;
   }
 
   /**
-   * Sender approves the paired receiver. Only the session owner may approve.
-   * @returns {string} the receiver socket id
+   * Sender approves a waiting receiver. Only the session owner may approve.
+   * With `receiverId` a specific receiver is approved (group mode); without it
+   * the first waiting receiver is approved (direct mode compatibility).
+   * @returns {string} the approved receiver's socket id
    */
-  approve({ sessionId, socketId }) {
+  approve({ sessionId, socketId, receiverId }) {
     const session = this.get(sessionId);
     if (!session) throw new SessionError('NOT_FOUND', 'Transfer session no longer exists.');
     if (session.senderSocketId !== socketId) {
       throw new SessionError('FORBIDDEN', 'Only the sender can approve a receiver.');
     }
-    if (session.state !== SessionState.PAIRED || !session.receiverSocketId) {
+    const target = receiverId ? session.receivers.get(receiverId) : undefined;
+    if (receiverId && !target) {
+      throw new SessionError('RECEIVER_GONE', 'That receiver is no longer connected.');
+    }
+    const candidate = target ?? [...session.receivers.values()].find((r) => r.state === ReceiverState.WAITING);
+    if (!candidate) {
       throw new SessionError('INVALID_STATE', 'No receiver is waiting for approval.');
     }
-    session.state = SessionState.APPROVED;
-    session.updatedAt = this.now();
+    if (candidate.state !== ReceiverState.WAITING) {
+      throw new SessionError('INVALID_STATE', 'That receiver is already approved.');
+    }
+    candidate.state = ReceiverState.APPROVED;
+    candidate.approvedAt = this.now();
     // Approval starts a new window so negotiation is never cut short.
-    session.expiresAt = session.updatedAt + this.ttlMs;
-    return session.receiverSocketId;
+    session.expiresAt = candidate.approvedAt + this.ttlMs;
+    this.#syncState(session);
+    return candidate.id;
   }
 
-  /** Mark the WebRTC data channel as open (sender only). */
-  markActive({ sessionId, socketId }) {
+  /**
+   * Sender approves every waiting receiver at once (group mode convenience).
+   * @returns {string[]} ids of the receivers that were approved
+   */
+  approveAll({ sessionId, socketId }) {
+    const session = this.get(sessionId);
+    if (!session) throw new SessionError('NOT_FOUND', 'Transfer session no longer exists.');
+    if (session.senderSocketId !== socketId) {
+      throw new SessionError('FORBIDDEN', 'Only the sender can approve receivers.');
+    }
+    const waiting = [...session.receivers.values()].filter((r) => r.state === ReceiverState.WAITING);
+    if (waiting.length === 0) {
+      throw new SessionError('INVALID_STATE', 'No receiver is waiting for approval.');
+    }
+    const approvedAt = this.now();
+    for (const receiver of waiting) {
+      receiver.state = ReceiverState.APPROVED;
+      receiver.approvedAt = approvedAt;
+    }
+    // Approval starts a new window so negotiation is never cut short.
+    session.expiresAt = approvedAt + this.ttlMs;
+    this.#syncState(session);
+    return waiting.map((receiver) => receiver.id);
+  }
+
+  /**
+   * Mark a receiver's WebRTC data channel as open (sender only).
+   * Without `receiverId` every approved receiver is marked active.
+   */
+  markActive({ sessionId, socketId, receiverId }) {
     const session = this.get(sessionId);
     if (!session) throw new SessionError('NOT_FOUND', 'Transfer session no longer exists.');
     if (session.senderSocketId !== socketId) {
       throw new SessionError('FORBIDDEN', 'Only the sender can update transfer state.');
     }
-    if (session.state !== SessionState.APPROVED && session.state !== SessionState.ACTIVE) {
-      throw new SessionError('INVALID_STATE', 'Session is not ready for a transfer yet.');
+    const targets = [];
+    if (receiverId) {
+      const receiver = session.receivers.get(receiverId);
+      if (!receiver) throw new SessionError('RECEIVER_GONE', 'That receiver is no longer connected.');
+      targets.push(receiver);
+    } else {
+      targets.push(...session.receivers.values());
+    }
+    for (const receiver of targets) {
+      if (receiver.state !== ReceiverState.APPROVED && receiver.state !== ReceiverState.ACTIVE) {
+        throw new SessionError('INVALID_STATE', 'Session is not ready for a transfer yet.');
+      }
+    }
+    const activatedAt = this.now();
+    for (const receiver of targets) {
+      if (receiver.state !== ReceiverState.ACTIVE) {
+        receiver.state = ReceiverState.ACTIVE;
+        receiver.activatedAt = activatedAt;
+      }
     }
     if (session.state !== SessionState.ACTIVE) {
-      session.state = SessionState.ACTIVE;
-      session.transferStartedAt = this.now();
-      session.updatedAt = this.now();
+      session.transferStartedAt = session.transferStartedAt ?? activatedAt;
     }
+    this.#syncState(session);
     return session;
   }
 
-  /** Sender rejected the receiver before approving. */
-  rejectReceiver({ sessionId, socketId }) {
+  /**
+   * Sender rejected receiver(s) before approving.
+   * With `receiverId` only that receiver is removed (group mode); without it
+   * every waiting receiver is removed. The session itself is NOT closed here -
+   * policy lives in the signaling layer (direct mode closes, group survives).
+   * @returns {string[]} ids of the removed receivers
+   */
+  rejectReceiver({ sessionId, socketId, receiverId }) {
     const session = this.get(sessionId);
     if (!session) throw new SessionError('NOT_FOUND', 'Transfer session no longer exists.');
     if (session.senderSocketId !== socketId) {
       throw new SessionError('FORBIDDEN', 'Only the sender can reject a receiver.');
     }
-    const receiverId = session.receiverSocketId;
-    this.close({ sessionId, reason: 'sender_rejected' });
-    return receiverId;
+    if (receiverId) {
+      if (!session.receivers.has(receiverId)) {
+        throw new SessionError('RECEIVER_GONE', 'That receiver is no longer connected.');
+      }
+      session.receivers.delete(receiverId);
+      this.#syncState(session);
+      return [receiverId];
+    }
+    const waitingIds = [];
+    for (const [id, receiver] of [...session.receivers]) {
+      if (receiver.state === ReceiverState.WAITING) {
+        session.receivers.delete(id);
+        waitingIds.push(id);
+      }
+    }
+    this.#syncState(session);
+    return waitingIds;
   }
 
   /**
@@ -254,13 +412,26 @@ export class SessionStore {
    * @returns {boolean} true when the slot was released
    */
   releaseReceiver({ sessionId, socketId }) {
-    const session = this.get(sessionId);
-    if (!session || session.receiverSocketId !== socketId) return false;
-    if (session.state !== SessionState.PAIRED) return false;
-    session.receiverSocketId = null;
-    session.state = SessionState.WAITING;
-    session.updatedAt = this.now();
+    const session = this.sessions.get(sessionId);
+    const receiver = session?.receivers.get(socketId);
+    if (!receiver || receiver.state !== ReceiverState.WAITING) return false;
+    session.receivers.delete(socketId);
+    this.#syncState(session);
     return true;
+  }
+
+  /**
+   * Remove a receiver regardless of its state (approved/active leaving).
+   * Returns the removed receiver record, or undefined when not a member.
+   * The session survives; callers decide whether to close it.
+   */
+  removeReceiver({ sessionId, socketId }) {
+    const session = this.sessions.get(sessionId);
+    const receiver = session?.receivers.get(socketId);
+    if (!receiver) return undefined;
+    session.receivers.delete(socketId);
+    this.#syncState(session);
+    return receiver;
   }
 
   /** Close a session permanently. Idempotent. */
