@@ -1,8 +1,8 @@
-import { ArrowLeftRight, Send, Download, Home } from 'lucide-react';
+import { ArrowLeftRight, Send, Download, Home, Type } from 'lucide-react';
 
 /**
- * Top navigation. The logo always returns to the homepage; the two actions
- * mirror the product's whole workflow (send / receive).
+ * Top navigation. The logo always returns to the homepage; the actions
+ * mirror the product's whole workflow (send files / send text / receive).
  */
 export function Navbar({ view, onNavigate }) {
   return (
@@ -36,6 +36,15 @@ export function Navbar({ view, onNavigate }) {
           >
             <Send size={15} aria-hidden="true" />
             <span className="label">Send</span>
+          </button>
+          <button
+            type="button"
+            className={`btn btn-sm ${view === 'send-text' ? 'btn-primary' : ''}`}
+            onClick={() => onNavigate('send-text')}
+            aria-current={view === 'send-text' ? 'page' : undefined}
+          >
+            <Type size={15} aria-hidden="true" />
+            <span className="label">Text</span>
           </button>
           <button
             type="button"

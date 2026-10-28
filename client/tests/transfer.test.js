@@ -731,3 +731,134 @@ describe('zero-byte files', () => {
     expect(received).toEqual([{ path: 'empty.txt', size: 0 }]);
   });
 });
+
+// ------------------------------------------------------------ text messages
+
+describe('text message transfer', () => {
+  it('round-trips a flagged text entry with the flag and content intact', async () => {
+    const message = 'const answer = 42;\n// paste → works ✓';
+    const bytes = new TextEncoder().encode(message);
+    const [chA, chB] = connectPair();
+
+    const manifestFiles = [];
+    let receivedBlob = null;
+    let accept = null;
+    const receiver = new ReceiverTransfer({
+      channel: chB,
+      onEvent: (event) => {
+        if (event.type === 'manifest') {
+          manifestFiles.push(...event.files);
+          if (accept) accept();
+        }
+      },
+      onFile: async (entry, blob) => {
+        receivedBlob = blob;
+        expect(entry.path).toBe('codeshare-text.txt');
+        expect(entry.text).toBe(true);
+      },
+    });
+    accept = () => receiver.accept();
+
+    // Mirror exactly what buildManifestEntries produces for createTextSelection.
+    const sender = new SenderTransfer({
+      channel: chA,
+      files: [
+        {
+          index: 0,
+          name: 'codeshare-text.txt',
+          path: 'codeshare-text.txt',
+          size: bytes.byteLength,
+          dir: false,
+          blob: new Blob([bytes], { type: 'text/plain;charset=utf-8' }),
+          text: true,
+        },
+      ],
+    });
+
+    const receiverPromise = receiver.run();
+    const senderResult = await sender.run();
+    const receiverResult = await receiverPromise;
+
+    expect(senderResult.status).toBe('complete');
+    expect(receiverResult.status).toBe('complete');
+
+    // The manifest the receiver's UI sees keeps the text flag.
+    expect(manifestFiles).toHaveLength(1);
+    expect(manifestFiles[0].text).toBe(true);
+    expect(manifestFiles[0].size).toBe(bytes.byteLength);
+
+    // The blob decodes back to the exact message (UTF-8 safe).
+    await expect(receivedBlob.text()).resolves.toBe(message);
+  });
+
+  it('does not add a text flag to ordinary file entries', async () => {
+    const [chA, chB] = connectPair();
+    let manifestEntry = null;
+    let accept = null;
+    const receiver = new ReceiverTransfer({
+      channel: chB,
+      onEvent: (event) => {
+        if (event.type === 'manifest') {
+          manifestEntry = event.files[0];
+          if (accept) accept();
+        }
+      },
+      onFile: async () => {},
+    });
+    accept = () => receiver.accept();
+
+    const sender = new SenderTransfer({
+      channel: chA,
+      files: makeFiles([{ path: 'notes.txt', bytes: new TextEncoder().encode('plain file') }]),
+    });
+
+    const receiverPromise = receiver.run();
+    await sender.run();
+    await receiverPromise;
+
+    expect(manifestEntry.text).toBeUndefined();
+  });
+
+  it('rejects a text entry above the receiver text cap before any byte moves', async () => {
+    const oversized = new Uint8Array(200); // 200 bytes of "text"
+    const [chA, chB] = connectPair();
+
+    const received = [];
+    let accept = null;
+    const receiver = new ReceiverTransfer({
+      channel: chB,
+      limits: { maxTextBytes: 100 },
+      onEvent: (event) => {
+        if (event.type === 'manifest' && accept) accept();
+      },
+      onFile: async (entry) => {
+        received.push(entry.path);
+      },
+    });
+    accept = () => receiver.accept();
+
+    const sender = new SenderTransfer({
+      channel: chA,
+      files: [
+        {
+          index: 0,
+          name: 'codeshare-text.txt',
+          path: 'codeshare-text.txt',
+          size: oversized.byteLength,
+          dir: false,
+          blob: new Blob([oversized]),
+          text: true,
+        },
+      ],
+    });
+
+    const receiverPromise = receiver.run();
+    const senderResult = await sender.run().catch((error) => ({ status: 'failed', error }));
+    const receiverResult = await receiverPromise.catch((error) => ({ status: 'failed', error }));
+
+    // Receiver rejects the manifest outright; nothing is delivered.
+    expect(receiverResult.status).not.toBe('complete');
+    expect(received).toHaveLength(0);
+    expect(senderResult.status).not.toBe('complete');
+  });
+});

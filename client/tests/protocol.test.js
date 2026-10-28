@@ -194,6 +194,54 @@ describe('validateManifest', () => {
   });
 });
 
+describe('validateManifest text flag', () => {
+  const textEntry = (size, overrides = {}) => ({
+    i: 0,
+    name: 'codeshare-text.txt',
+    path: 'codeshare-text.txt',
+    size,
+    dir: false,
+    text: true,
+    ...overrides,
+  });
+
+  it('passes a text flag through for a flagged entry', () => {
+    const result = validateManifest({ files: [textEntry(12)] });
+    expect(result.files[0].text).toBe(true);
+    expect(result.totalBytes).toBe(12);
+  });
+
+  it('leaves ordinary file entries unflagged', () => {
+    const result = validateManifest({
+      files: [{ i: 0, name: 'a.txt', path: 'a.txt', size: 5, dir: false }],
+    });
+    expect(result.files[0].text).toBeUndefined();
+  });
+
+  it('drops a non-boolean text flag instead of trusting it', () => {
+    const result = validateManifest({ files: [textEntry(12, { text: 'yes' })] });
+    expect(result.files[0].text).toBeUndefined();
+  });
+
+  it('rejects a text flag on a directory entry', () => {
+    expect(() =>
+      validateManifest({
+        files: [{ i: 0, name: 'folder', path: 'folder', size: 0, dir: true, text: true }],
+      })
+    ).toThrow(/directory/i);
+  });
+
+  it('rejects a text entry above the text size cap', () => {
+    expect(() => validateManifest({ files: [textEntry(101)] }, { maxTextBytes: 100 })).toThrow(
+      /text message/i
+    );
+    // Exactly at the cap is fine.
+    expect(validateManifest({ files: [textEntry(100)] }, { maxTextBytes: 100 }).files[0].text).toBe(
+      true
+    );
+  });
+});
+
 describe('classifyFrame', () => {
   it('classifies a JSON string as control', () => {
     const frame = classifyFrame(encodeControl({ type: CONTROL_TYPES.ACCEPT }));

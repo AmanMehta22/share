@@ -124,6 +124,49 @@ export function createSelection({ kind, name, records }) {
   return selection;
 }
 
+/**
+ * Build a selection for a plain-text message.
+ *
+ * The text travels through the exact same engine as files (manifest ->
+ * consent -> chunks -> integrity check) but is flagged so the receiver shows
+ * it on screen with a copy button instead of writing it to disk.
+ *
+ * @param {string} text
+ * @param {{fileName?: string}} [options]
+ * @returns {ReturnType<typeof createSelection> & {isText: true, characters: number}}
+ */
+export function createTextSelection(text, options = {}) {
+  const fileName = options.fileName ?? 'codeshare-text.txt';
+  if (typeof text !== 'string' || text.length === 0) {
+    throw new SelectionError('EMPTY', 'Type or paste some text first.');
+  }
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.byteLength > LIMITS.maxTextBytes) {
+    throw new SelectionError(
+      'TOO_LARGE',
+      `The text is ${bytes.byteLength} bytes; the limit is ${LIMITS.maxTextBytes} bytes (10 MB).`
+    );
+  }
+  const blob = new Blob([bytes], { type: 'text/plain;charset=utf-8' });
+  const selection = {
+    kind: 'text',
+    name: 'Text message',
+    files: [{ path: fileName, name: fileName, size: bytes.byteLength, blob, text: true }],
+    dirs: [],
+    totalBytes: bytes.byteLength,
+    itemCount: 1,
+    fileCount: 1,
+    dirCount: 0,
+    isText: true,
+    characters: text.length,
+  };
+  const problems = validateSelection(selection);
+  if (problems.length > 0) {
+    throw new SelectionError('INVALID', problems.join(' '));
+  }
+  return selection;
+}
+
 /** Validate an existing selection; returns an array of human-readable problems. */
 export function validateSelection(selection) {
   const problems = [];
@@ -172,7 +215,9 @@ export function buildManifestEntries(selection) {
   const entries = [];
   let index = 0;
   for (const file of selection.files) {
-    entries.push({ i: index, name: file.name, path: file.path, size: file.size, dir: false, blob: file.blob });
+    const entry = { i: index, name: file.name, path: file.path, size: file.size, dir: false, blob: file.blob };
+    if (file.text === true) entry.text = true;
+    entries.push(entry);
     index += 1;
   }
   for (const dir of selection.dirs) {

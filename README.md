@@ -2,10 +2,10 @@
 
 **Free, code-based peer-to-peer file transfer. No accounts, no storage, no paid services.**
 
-CodeShare moves files and folders directly between computers. One side picks files and gets a
-one-time code like `ABCD-EFGH-JKMN-PQRS`; the other side types that code, reviews the file list, and
-accepts. The bytes then travel **browser to browser over WebRTC** — they are never uploaded to any
-server.
+CodeShare moves files, folders, or a block of plain text directly between computers. One side picks
+files (or pastes text) and gets a one-time code like `ABCD-EFGH-JKMN-PQRS`; the other side types
+that code, reviews what is coming, and accepts. The bytes then travel **browser to browser over
+WebRTC** — they are never uploaded to any server.
 
 Two send modes are built in:
 
@@ -14,6 +14,10 @@ Two send modes are built in:
   gets their own independent, encrypted peer connection and their own consent gate. The sender
   approves receivers one by one or all at once, watches per-receiver progress, and sees an honest
   per-receiver outcome summary at the end.
+
+Both modes work for **files and folders** (Send files page) and for **plain text** (Send text page:
+paste a note, code snippet or log up to 10 MB — the receiver copies it with one click or downloads
+it as a `.txt`).
 
 - **₹0 / $0 cost** — no paid storage, no database, no TURN service, no domain, no API keys, no OTP
   emails or SMS. Nothing in this project can generate a charge.
@@ -72,7 +76,6 @@ Two send modes are built in:
 │    15-min TTL, single use)                   │          │
 │  · relays SDP offers/answers + ICE candidates│          │
 │  · routes signals per receiver (1:1 or 1:N)  │          │
-│  · rate limits + join-attempt caps           │          │
 │  · rate limits + join-attempt caps           │          │
 │                                              │          │
 │  ✗ has NO route that accepts file uploads    │          │
@@ -173,12 +176,23 @@ leave before approval free their slot; late joiners can still be approved while 
 end screen summarizes every receiver's real outcome (received ✓, declined, cancelled, failed) —
 never a blanket "success".
 
+**Sender (text):** open the *Send text* page → paste or type a message (a note, code snippet, log —
+up to 10 MB, with a live character/byte counter) → pick one-to-one or one-to-many → generate the
+code. Everything after that is the same flow as files: share the code, approve receivers, watch
+progress. The text travels as a single flagged manifest entry through the identical
+consent → chunk → verify pipeline — there is no separate "text protocol".
+
 **Receiver:** enter the code (normalization handles lowercase, spaces, dots, pasted messiness) →
 wait for sender approval → review the incoming file list and total size → pick a save mode →
 *Accept & receive* → real progress, pause/resume/cancel → files written by your own browser →
 success/rollback screen → *Receive another transfer*. The receiver screen is identical in both
 modes — a group receiver cannot tell (and does not need to know) that others are receiving the same
 files.
+
+**Receiver (text):** same join/approve flow, but the review screen says "Incoming text message" and
+offers no save-mode choice (nothing is written to disk). After the transfer the message appears in
+a read-only text box with a **Copy** button (with a manual-select fallback if the clipboard API is
+blocked) and an optional **Download .txt** button.
 
 Both sides detect disconnects, expired codes, rejects, and channel errors, and always end on an
 explicit success / cancelled / failed screen — never a fake progress bar or a false "done".
@@ -261,16 +275,18 @@ npm test
   tombstones, per-IP join-attempt caps, and 38 **integration tests over real loopback sockets**
   exercising the full Socket.IO contract (acks, `peer:*` events with receiverId routing, per-peer
   signal relay, malformed/oversized payload rejection, group cancel/disconnect semantics).
-- **Client (120 tests):** code generation (entropy, rejection sampling, no excluded characters),
+- **Client (136 tests):** code generation (entropy, rejection sampling, no excluded characters),
   path sanitization (traversal, NULs, reserved names, dedupe), the ZIP writer (CRC32 vectors,
   archive structure, round-trip bytes, unsafe-path rejection), the binary protocol (frame
-  encode/decode, manifest validation, oversized/unknown frames), the **transfer engines over a
-  fake in-memory data channel**: happy paths, multi-file, directory entries, byte-for-byte
-  integrity, binary-only frames, consent gating, reject, pause/resume, cancel from both sides,
-  peer disconnect, out-of-order/size-mismatch detection, streaming folder writer with abort,
-  backpressure, zero-byte files, and the **group orchestrator**: parallel receivers with
-  independent outcomes (one rejects / drops / cancels without corrupting the others), pause-all /
-  resume-all / cancel-all, and honest per-receiver summaries.
+  encode/decode, manifest validation including the **text flag** rules, oversized/unknown frames),
+  the **transfer engines over a fake in-memory data channel**: happy paths, multi-file, directory
+  entries, byte-for-byte integrity, binary-only frames, consent gating, reject, pause/resume,
+  cancel from both sides, peer disconnect, out-of-order/size-mismatch detection, streaming folder
+  writer with abort, backpressure, zero-byte files, **text-message round-trips (flag preserved,
+  UTF-8 content intact, oversized text rejected before any byte moves)**, text selection building
+  (character vs UTF-8 byte accounting, 10 MB cap, blob encoding), and the **group orchestrator**:
+  parallel receivers with independent outcomes (one rejects / drops / cancels without corrupting
+  the others), pause-all / resume-all / cancel-all, and honest per-receiver summaries.
 
 These verify everything that does not require two real browsers with real WebRTC.
 
@@ -297,6 +313,16 @@ WebRTC peer connections need real browsers; that part is verified by hand:
 5. Verify: per-receiver progress rows on A, real transfer on B and C, files identical on both.
 6. Kill window C mid-transfer → A marks only C failed; B must finish normally and A's final screen
    must show B ✓ / C failed.
+
+**Two windows, one computer — text message smoke test:**
+1. Window A → *Send text* → paste a multi-line message with emoji/accents → *Generate transfer
+   code* (try one-to-many once too).
+2. Window B → *Receive files* → type the code → connect. Window A → approve.
+3. Window B shows "Incoming text message" (no save-mode choice) → *Accept & receive text*.
+4. Verify: the on-screen text matches exactly (line breaks, unicode), *Copy* puts it on the
+   clipboard ("Copied!" feedback), *Download .txt* saves a matching file, and *Receive another
+   transfer* resets the screen.
+5. Paste >10 MB of text on the sender → the page blocks generation with a clear over-limit message.
 
 **Two computers (LAN):** same steps; open `http://<sender-LAN-IP>:5173` (or :4000 in production
 mode) on the receiver. Both machines must be able to reach the signaling server.
@@ -335,7 +361,8 @@ free or hobby tiers that can run `npm start` with a Node build. Steps (example: 
 host (GitHub Pages, Netlify, Cloudflare Pages, Vercel) and run the signaling server on a free Node
 host. Then set `VITE_SIGNALING_URL=https://your-signaling-host.example` at **build time**
 (`$env:VITE_SIGNALING_URL="https://..."; npm run build`) and set that host's `CLIENT_ORIGIN` to the
-static site's URL. The frontend uses hash routing (`#/home`, `#/send`, `#/receive`), so static hosts
+static site's URL. The frontend uses hash routing (`#/home`, `#/send`, `#/send-text`, `#/receive`),
+so static hosts
 need **no rewrite rules**.
 
 **What these free tiers can and cannot do:** they are entirely sufficient because only signaling
@@ -480,7 +507,7 @@ CodeShare does with them:
 
 | Resource | Typical free allowance | CodeShare usage |
 |---|---|---|
-| Static hosting bandwidth (Pages/Netlify/Vercel) | 100 GB/month | Frontend assets only (~120 KB gzipped, cached) — effectively unlimited for personal use |
+| Static hosting bandwidth (Pages/Netlify/Vercel) | 100 GB/month | Frontend assets only (~124 KB gzipped, cached) — effectively unlimited for personal use |
 | Node host (Render/Railway/Fly/Glitch) | 100–500 hours/month, spins down when idle | A few KB per session; idle spin-down only adds seconds to the first connection |
 | WebSocket connections | usually supported; idle timeouts 1–5 min | Socket.IO heartbeats keep them alive; transfers are typically done well within any timeout |
 | RAM on free Node instances | 256–512 MB | Server holds only session metadata (KB per session, capped per IP) |
@@ -490,23 +517,27 @@ you** — no third-party APIs, no metered relay, no storage service.
 
 ## What is tested automatically vs. manually
 
-**Automatically verified by `npm test` (236 tests):**
+**Automatically verified by `npm test` (252 tests):**
 code generation entropy & normalization; invalid/expired/unknown codes; duplicate receivers and
 group capacity limits (SESSION_FULL); session TTL expiry (with ACTIVE exemption); sender
 approve/reject including per-receiver and approve-all; group signal routing by receiverId/peerId;
 one receiver leaving without killing the group session; signaling validation (all message types,
 malformed and oversized payloads); unauthorized signaling; disconnect handling and cleanup; rate
-limits and repeated invalid join attempts; binary frame codec; manifest validation; chunk ordering,
-size verification and integrity; multi-file and zero-byte transfers; pause/resume/cancel from both
-sides; consent gating; streaming writer with abort-on-cancel; backpressure; ZIP writer CRC and
-structure; path traversal prevention; and the group orchestrator (parallel receivers, mixed
-outcomes, pause/resume/cancel-all, honest per-receiver summaries).
+limits and repeated invalid join attempts; binary frame codec; manifest validation including the
+plain-text flag (flag preserved only for non-directory entries, text-size cap enforced on the
+receiver); chunk ordering, size verification and integrity; multi-file and zero-byte transfers;
+text-message round-trips (UTF-8 content intact end to end, oversized text rejected before any byte
+moves); text selection building (character vs UTF-8 byte accounting, 10 MB cap, blob encoding);
+pause/resume/cancel from both sides; consent gating; streaming writer with abort-on-cancel;
+backpressure; ZIP writer CRC and structure; path traversal prevention; and the group orchestrator
+(parallel receivers, mixed outcomes, pause/resume/cancel-all, honest per-receiver summaries).
 
 **Requires manual two-computer testing (cannot be automated in Node):**
 real browser-to-browser WebRTC connection across real NATs; actual DTLS encryption end-to-end;
-true disk streaming via the File System Access API; drag-and-drop and folder-pick UX; clipboard
-copy; browser download behavior; performance on real multi-GB files; and the honest NAT-limitation
-error paths described above. The checklist is in [Testing](#manual-two-computer-test-required-for-full-verification).
+true disk streaming via the File System Access API; drag-and-drop and folder-pick UX; clipboard copy
+behavior (including the execCommand fallback when the async clipboard API is blocked); browser
+download behavior; performance on real multi-GB files; and the honest NAT-limitation error paths
+described above. The checklist is in [Testing](#manual-two-computer-test-required-for-full-verification).
 
 **Not done and not claimed:** this project has no browser-E2E suite (no Playwright/Selenium) and
 has not been deployed to any hosting provider as part of its development — the hosting steps above

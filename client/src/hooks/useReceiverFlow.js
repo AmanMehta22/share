@@ -35,6 +35,8 @@ export const SAVE_MODE = Object.freeze({
   DOWNLOAD: 'download',
   ZIP: 'zip',
   DIRECTORY: 'directory',
+  /** Plain-text message: shown on screen with a copy button, never written. */
+  TEXT: 'text',
 });
 
 const TERMINAL_PHASES = new Set([
@@ -88,6 +90,7 @@ export function useReceiverFlow() {
     channel: null,
     manifest: null,
     saverMode: null,
+    textBlob: null,
     directoryHandle: null,
     zipEntries: [],
     zipDirs: [],
@@ -166,6 +169,12 @@ export function useReceiverFlow() {
 
   const handleFile = useCallback(async (entry, blob) => {
     const state = refs.current;
+    if (state.saverMode === SAVE_MODE.TEXT) {
+      // Plain-text message: keep the blob so finalize() can decode it for the
+      // on-screen copy box. Nothing is written to disk.
+      state.textBlob = blob;
+      return;
+    }
     if (state.saverMode === SAVE_MODE.DIRECTORY) {
       // Files are already streamed to disk by the writer; only empty
       // directories still need an explicit create.
@@ -198,6 +207,30 @@ export function useReceiverFlow() {
         fileCount: engineResult.fileCount ?? state.manifest?.fileCount ?? 0,
         saveMode: state.saverMode,
       };
+
+      if (state.saverMode === SAVE_MODE.TEXT) {
+        if (!state.textBlob) {
+          setError(describeError(Object.assign(new Error('No text was received.'), { code: 'INCOMPLETE' })));
+          changePhase(RECEIVER_PHASE.FAILED);
+          return;
+        }
+        try {
+          const text = await state.textBlob.text();
+          const fileName = state.manifest?.files?.[0]?.path ?? 'codeshare-text.txt';
+          setResult({ ...summary, savedTo: 'text', text, fileName, characters: text.length });
+          changePhase(RECEIVER_PHASE.COMPLETED);
+        } catch (decodeError) {
+          setError(
+            describeError(
+              Object.assign(new Error(decodeError?.message ?? 'Could not read the received text.'), {
+                code: 'INCOMPLETE',
+              })
+            )
+          );
+          changePhase(RECEIVER_PHASE.FAILED);
+        }
+        return;
+      }
 
       if (state.saverMode === SAVE_MODE.DIRECTORY) {
         setResult({ ...summary, saved: true, savedTo: 'folder' });
@@ -295,11 +328,14 @@ export function useReceiverFlow() {
     (event) => {
       switch (event.type) {
         case 'manifest': {
+          const textFiles = event.files.filter((entry) => entry.text === true && !entry.dir);
           const nextManifest = {
             files: event.files,
             totalBytes: event.totalBytes,
             fileCount: event.fileCount,
             hasDirectories: event.hasDirectories,
+            // A single flagged entry means: show this as text, not as a file.
+            isText: event.files.length === 1 && textFiles.length === 1,
           };
           refs.current.manifest = nextManifest;
           setManifest(nextManifest);
@@ -361,6 +397,7 @@ export function useReceiverFlow() {
       state.zipDirs = [];
       state.downloadItems = [];
       state.saverMode = null;
+      state.textBlob = null;
       state.directoryHandle = null;
 
       const engine = new ReceiverTransfer({
@@ -573,6 +610,7 @@ export function useReceiverFlow() {
       state.zipEntries = [];
       state.zipDirs = [];
       state.downloadItems = [];
+      state.textBlob = null;
       setSaveMode(mode);
 
       const accepted = state.engine.accept();
@@ -625,6 +663,7 @@ export function useReceiverFlow() {
     state.zipDirs = [];
     state.downloadItems = [];
     state.saverMode = null;
+    state.textBlob = null;
     state.directoryHandle = null;
     state.meter = new SpeedMeter();
     setManifest(null);
@@ -654,6 +693,8 @@ export function useReceiverFlow() {
   /** Save modes offered for the current manifest, best option first. */
   const saveModes = useMemo(() => {
     if (!manifest) return [];
+    // Text messages are shown on screen with a copy button - no save options.
+    if (manifest.isText) return [];
     const singleFile = manifest.fileCount === 1 && !manifest.hasDirectories;
     const modes = [];
     if (singleFile) {

@@ -1008,6 +1008,52 @@
   color: var(--danger);
 }
 
+/* ------------------------------------------------------- send/receive text */
+
+.text-input {
+  width: 100%;
+  min-height: 180px;
+  padding: var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: 0.93rem;
+  line-height: 1.55;
+  resize: vertical;
+}
+.text-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.text-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.text-viewer {
+  width: 100%;
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-alt);
+  color: var(--text);
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: 0.93rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  resize: vertical;
+  max-height: 420px;
+}
+.text-viewer:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .result-badge {
   display: grid;
   place-items: center;

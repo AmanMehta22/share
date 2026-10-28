@@ -155,14 +155,15 @@ function isPlainObject(value) {
  * Everything in here is untrusted peer input.
  *
  * @param {unknown} manifest
- * @param {{maxFiles?:number, maxPathLength?:number, maxNameLength?:number, maxTotalBytes?:number}} limits
- * @returns {{files:Array<{i:number,name:string,path:string,size:number,dir:boolean}>, totalBytes:number, hasDirectories:boolean}}
+ * @param {{maxFiles?:number, maxPathLength?:number, maxNameLength?:number, maxTotalBytes?:number, maxTextBytes?:number}} limits
+ * @returns {{files:Array<{i:number,name:string,path:string,size:number,dir:boolean,text?:true}>, totalBytes:number, hasDirectories:boolean}}
  */
 export function validateManifest(manifest, limits = {}) {
   const maxFiles = limits.maxFiles ?? 100_000;
   const maxPathLength = limits.maxPathLength ?? 1024;
   const maxNameLength = limits.maxNameLength ?? 255;
   const maxTotalBytes = limits.maxTotalBytes ?? Number.MAX_SAFE_INTEGER;
+  const maxTextBytes = limits.maxTextBytes ?? 10 * 1024 * 1024;
 
   if (!isPlainObject(manifest)) {
     throw new ProtocolError('BAD_MANIFEST', 'Manifest must be an object.');
@@ -202,6 +203,17 @@ export function validateManifest(manifest, limits = {}) {
     if (entry.path.includes('\u0000')) {
       throw new ProtocolError('BAD_ENTRY', `Entry #${index} path contains a NUL byte.`);
     }
+    // A "text" entry is a plain-text message the receiver shows on screen
+    // with a copy button instead of writing it to disk. Untrusted input: the
+    // flag only survives when it is exactly `true` on a non-directory entry
+    // within the text size cap.
+    const isText = entry.text === true;
+    if (isText && dir) {
+      throw new ProtocolError('BAD_ENTRY', `Entry #${index}: a directory cannot be a text message.`);
+    }
+    if (isText && size > maxTextBytes) {
+      throw new ProtocolError('TOO_LARGE', 'The text message exceeds the allowed size.');
+    }
     if (seenPaths.has(entry.path)) {
       throw new ProtocolError('DUPLICATE_PATH', `Duplicate path in manifest: ${entry.path}`);
     }
@@ -213,7 +225,9 @@ export function validateManifest(manifest, limits = {}) {
     }
     if (dir) hasDirectories = true;
 
-    files.push({ i: index, name: entry.name, path: entry.path, size, dir });
+    const normalized = { i: index, name: entry.name, path: entry.path, size, dir };
+    if (isText) normalized.text = true;
+    files.push(normalized);
   }
 
   if (totalBytes > maxTotalBytes) {

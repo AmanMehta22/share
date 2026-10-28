@@ -10,6 +10,7 @@ import {
   Server,
   WifiOff,
   Globe,
+  Type,
 } from 'lucide-react';
 
 /**
@@ -27,9 +28,9 @@ export function HomePage({ onNavigate }) {
         </span>
         <h1>Transfer files. Simply and directly.</h1>
         <p className="hero-sub">
-          CodeShare moves files and folders straight between two computers using a one-time code.
-          File bytes never touch a server - only a tiny signaling service introduces the two
-          browsers to each other.
+          CodeShare moves files, folders or a block of plain text straight between two computers
+          using a one-time code. Payload bytes never touch a server - only a tiny signaling service
+          introduces the two browsers to each other.
         </p>
 
         <div className="hero-points">
@@ -48,8 +49,8 @@ export function HomePage({ onNavigate }) {
         </div>
 
         <div
-          className="grid-2"
-          style={{ maxWidth: 760, margin: '40px auto 0', textAlign: 'left' }}
+          className="grid-3"
+          style={{ maxWidth: 860, margin: '40px auto 0', textAlign: 'left' }}
         >
           <button
             type="button"
@@ -72,15 +73,33 @@ export function HomePage({ onNavigate }) {
           <button
             type="button"
             className="card card-action"
+            onClick={() => onNavigate('send-text')}
+          >
+            <span className="card-icon">
+              <Type size={22} aria-hidden="true" />
+            </span>
+            <h3>Send text</h3>
+            <p className="muted small">
+              Paste a note, code snippet or log (up to 10 MB) and share a code. The receiver copies
+              it with one click - nothing is uploaded anywhere.
+            </p>
+            <span className="row small" style={{ color: 'var(--accent-strong)', fontWeight: 650 }}>
+              Start sending text <ArrowRight size={15} aria-hidden="true" />
+            </span>
+          </button>
+
+          <button
+            type="button"
+            className="card card-action"
             onClick={() => onNavigate('receive')}
           >
             <span className="card-icon alt">
               <Download size={22} aria-hidden="true" />
             </span>
-            <h3>Receive files</h3>
+            <h3>Receive</h3>
             <p className="muted small">
-              Enter the code from the sender, review exactly what is being shared, then accept and
-              choose where to save it - download, ZIP, or a folder.
+              Enter the code from the sender, review exactly what is being shared, then accept -
+              files save to disk, text appears ready to copy.
             </p>
             <span className="row small" style={{ color: '#6d28d9', fontWeight: 650 }}>
               Start receiving <ArrowRight size={15} aria-hidden="true" />
@@ -98,10 +117,11 @@ export function HomePage({ onNavigate }) {
         <div className="steps">
           <div className="step">
             <span className="step-num">1</span>
-            <h3>Sender selects files</h3>
+            <h3>Sender picks the payload</h3>
             <p>
-              Choose a ZIP, several files, or a whole folder. CodeShare generates a short
-              one-time code like <span className="mono">ABCD-EFGH-JKLM-NPQR</span>.
+              Choose a ZIP, several files or a whole folder - or switch to the text page and paste
+              a message. CodeShare generates a short one-time code like{' '}
+              <span className="mono">ABCD-EFGH-JKLM-NPQR</span>.
             </p>
           </div>
           <div className="step">
@@ -221,6 +241,10 @@ export function HomePage({ onNavigate }) {
             <button type="button" className="btn btn-primary btn-lg" onClick={() => onNavigate('send')}>
               <Send size={18} aria-hidden="true" />
               Send files
+            </button>
+            <button type="button" className="btn btn-lg" onClick={() => onNavigate('send-text')}>
+              <Type size={18} aria-hidden="true" />
+              Send text
             </button>
             <button type="button" className="btn btn-lg" onClick={() => onNavigate('receive')}>
               <Download size={18} aria-hidden="true" />

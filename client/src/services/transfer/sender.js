@@ -309,13 +309,19 @@ export class SenderTransfer {
     try {
       this.#assertOpen();
 
-      const manifestFiles = this.files.map((file, index) => ({
-        i: index,
-        name: file.name,
-        path: file.path,
-        size: file.size,
-        dir: file.dir === true,
-      }));
+      const manifestFiles = this.files.map((file, index) => {
+        const entry = {
+          i: index,
+          name: file.name,
+          path: file.path,
+          size: file.size,
+          dir: file.dir === true,
+        };
+        // Plain-text messages keep their flag so the receiver can render them
+        // with a copy button instead of offering file-save options.
+        if (file.text === true && entry.dir === false) entry.text = true;
+        return entry;
+      });
 
       this.#sendControl({
         type: CONTROL_TYPES.MANIFEST,

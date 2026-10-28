@@ -14,7 +14,7 @@ import { createSignalingClient, SIGNAL_EVENTS } from '../services/signaling.js';
 import { PeerSession, supportsWebRTC } from '../services/webrtc.js';
 import { SenderTransfer } from '../services/transfer/sender.js';
 import { SenderGroup } from '../services/transfer/senderGroup.js';
-import { buildManifestEntries, validateSelection } from '../utils/selection.js';
+import { buildManifestEntries, createTextSelection, validateSelection } from '../utils/selection.js';
 import { describeError } from '../utils/errors.js';
 
 /** Every state the sender screen can be in. */
@@ -338,6 +338,25 @@ export function useSenderFlow() {
     async (builder) => {
       try {
         const built = await builder();
+        setSelection(built);
+        return built;
+      } catch (buildError) {
+        setSelectionError(describeError(buildError));
+        return null;
+      }
+    },
+    [setSelection]
+  );
+
+  /**
+   * Use a plain-text message as the payload (Send text page). Returns the
+   * built selection, or null with `selectionError` set.
+   * @param {string} text
+   */
+  const setTextSelection = useCallback(
+    (text) => {
+      try {
+        const built = createTextSelection(text);
         setSelection(built);
         return built;
       } catch (buildError) {
@@ -1181,6 +1200,7 @@ export function useSenderFlow() {
     setSelection,
     clearSelection,
     loadSelection,
+    setTextSelection,
     generateCode,
     approveReceiver,
     approveAllReceivers,

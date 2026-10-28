@@ -3,9 +3,10 @@ import { Navbar } from './components/Navbar.jsx';
 import { Footer } from './components/Footer.jsx';
 import { HomePage } from './pages/HomePage.jsx';
 import { SendPage } from './pages/SendPage.jsx';
+import { SendTextPage } from './pages/SendTextPage.jsx';
 import { ReceivePage } from './pages/ReceivePage.jsx';
 
-const VALID_VIEWS = new Set(['home', 'send', 'receive']);
+const VALID_VIEWS = new Set(['home', 'send', 'send-text', 'receive']);
 
 function viewFromHash() {
   const raw = window.location.hash.replace(/^#\/?/, '').toLowerCase();
@@ -13,7 +14,7 @@ function viewFromHash() {
 }
 
 /**
- * Tiny hash-router shell: /#/home, /#/send, /#/receive.
+ * Tiny hash-router shell: /#/home, /#/send, /#/send-text, /#/receive.
  * Hash routing means the static build works on any free host without
  * server-side rewrite rules.
  */
@@ -44,6 +45,7 @@ export function App() {
       <Navbar view={view} onNavigate={navigate} />
       {view === 'home' && <HomePage onNavigate={navigate} />}
       {view === 'send' && <SendPage onNavigate={navigate} />}
+      {view === 'send-text' && <SendTextPage onNavigate={navigate} />}
       {view === 'receive' && <ReceivePage onNavigate={navigate} />}
       <Footer />
     </>

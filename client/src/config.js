@@ -47,6 +47,8 @@ export const LIMITS = Object.freeze({
   maxNameLength: 255,
   maxDepth: 32,
   maxManifestChars: 2_000_000,
+  /** Largest plain-text message (UTF-8 bytes), enforced on both sides. */
+  maxTextBytes: 10 * 1024 * 1024,
 });
 
 /** Browsers with these features get the nicer folder-save experience. */
