@@ -1,0 +1,26 @@
+{
+  "name": "codeshare-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal WebRTC signaling server for CodeShare. Holds only temporary in-memory session state; never sees file contents.",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "socket.io-client": "^4.8.4",
+    "vitest": "^5.0.5"
+  }
+}
