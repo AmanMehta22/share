@@ -15,8 +15,8 @@ export const DEFAULTS = Object.freeze({
   SESSION_TTL_MINUTES: '15',
   MAX_JOIN_ATTEMPTS: '5',
   MAX_SESSIONS_PER_IP: '10',
-  MAX_RECEIVERS: '10',
-  MAX_SIGNALS_PER_MINUTE: '600',
+  MAX_RECEIVERS: '100',
+  MAX_SIGNALS_PER_MINUTE: '3000',
   TRUST_PROXY: '0',
   SERVE_CLIENT: '1',
 });
@@ -122,7 +122,7 @@ export function resolveConfig(env = process.env, options = {}) {
     sessionTtlMs: parseInt10(pick('SESSION_TTL_MINUTES'), 'SESSION_TTL_MINUTES', { min: 1, max: 1440 }) * 60_000,
     maxJoinAttempts: parseInt10(pick('MAX_JOIN_ATTEMPTS'), 'MAX_JOIN_ATTEMPTS', { min: 1, max: 1000 }),
     maxSessionsPerIp: parseInt10(pick('MAX_SESSIONS_PER_IP'), 'MAX_SESSIONS_PER_IP', { min: 1, max: 1000 }),
-    maxReceivers: parseInt10(pick('MAX_RECEIVERS'), 'MAX_RECEIVERS', { min: 1, max: 50 }),
+    maxReceivers: parseInt10(pick('MAX_RECEIVERS'), 'MAX_RECEIVERS', { min: 1, max: 100 }),
     maxSignalsPerMinute: parseInt10(pick('MAX_SIGNALS_PER_MINUTE'), 'MAX_SIGNALS_PER_MINUTE', {
       min: 10,
       max: 100_000,

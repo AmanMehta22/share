@@ -62,8 +62,8 @@ export function HomePage({ onNavigate }) {
             </span>
             <h3>Send files</h3>
             <p className="muted small">
-              Pick files or a folder, generate a code, and wait for the receiver to join and
-              approve. Progress, speed and pause controls included.
+              Pick files or a folder, generate a code, and connect with the receiver the moment they
+              join. Progress, speed and pause controls included.
             </p>
             <span className="row small" style={{ color: 'var(--accent-strong)', fontWeight: 650 }}>
               Start sending <ArrowRight size={15} aria-hidden="true" />
@@ -128,8 +128,8 @@ export function HomePage({ onNavigate }) {
             <span className="step-num">2</span>
             <h3>Receiver joins with the code</h3>
             <p>
-              The sender sees the join request and approves it. Both sides then connect directly,
-              browser to browser, over WebRTC.
+              The connection starts automatically the moment they join - no approval clicks. Both
+              sides then connect directly, browser to browser, over WebRTC.
             </p>
           </div>
           <div className="step">

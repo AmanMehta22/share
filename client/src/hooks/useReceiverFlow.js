@@ -63,7 +63,7 @@ function inferArchiveName(files) {
 
 /**
  * Drives the receiver flow:
- *   enter code -> join session -> sender approves -> WebRTC ->
+ *   enter code -> join session -> auto-approved -> WebRTC ->
  *   review manifest -> accept (choose save mode) -> receive -> save.
  */
 export function useReceiverFlow() {
@@ -559,7 +559,7 @@ export function useReceiverFlow() {
               if (refs.current.phase !== RECEIVER_PHASE.WAITING) return;
               failFlow(
                 describeError(
-                  Object.assign(new Error('The transfer session expired before the sender approved.'), {
+                  Object.assign(new Error('The transfer session expired before it could connect.'), {
                     code: 'NOT_FOUND',
                   })
                 )

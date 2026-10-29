@@ -65,7 +65,7 @@ export class SessionStore {
       ttlMs = 15 * 60_000,
       maxJoinAttempts = 5,
       maxSessionsPerIp = 10,
-      maxReceiversPerSession = 10,
+      maxReceiversPerSession = 100,
       now = () => Date.now(),
     } = options;
     if (!Number.isFinite(ttlMs) || ttlMs < 1000) throw new Error('ttlMs must be >= 1000');

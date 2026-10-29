@@ -238,13 +238,11 @@ export function ReceivePage({ onNavigate }) {
             <Spinner size="lg" />
             <div>
               <strong>
-                {phase === RECEIVER_PHASE.WAITING
-                  ? 'Waiting for the sender to approve…'
-                  : 'Connecting directly…'}
+                {phase === RECEIVER_PHASE.WAITING ? 'Joining the transfer…' : 'Connecting directly…'}
               </strong>
               <p className="muted small">
                 {phase === RECEIVER_PHASE.WAITING
-                  ? 'The sender must approve this join request on their screen.'
+                  ? 'Connecting to the sender automatically. This takes a moment.'
                   : 'Negotiating a peer-to-peer route. This can take a few seconds.'}
               </p>
             </div>

@@ -40,12 +40,12 @@ export const SEND_MODE = Object.freeze({
 });
 
 /** Group sizes offered in the UI (server may cap lower via MAX_RECEIVERS). */
-export const GROUP_SIZE_OPTIONS = Object.freeze([2, 3, 5, 10]);
+export const GROUP_SIZE_OPTIONS = Object.freeze([2, 3, 5, 10, 25, 50, 100]);
 
 /** Per-receiver states in a group transfer. */
 export const RECEIVER_ROW_STATE = Object.freeze({
-  WAITING: 'waiting', // joined, waiting for sender approval
-  APPROVED: 'approved', // sender approved, WebRTC negotiation starting
+  WAITING: 'waiting', // joined; auto-connect starts immediately
+  APPROVED: 'approved', // cleared to connect, WebRTC negotiation starting
   CONNECTING: 'connecting', // negotiating the peer connection
   AWAITING_ACCEPT: 'awaiting-accept', // manifest sent, receiver reviewing files
   TRANSFERRING: 'transferring', // bytes are flowing
@@ -112,9 +112,12 @@ function makeRow(id) {
 
 /**
  * Drives the whole sender flow in both modes:
- *   direct: select files -> code -> one receiver joins -> approve -> stream.
- *   group:  select files -> code -> up to N receivers join -> approve each
- *           (or all) -> one independent WebRTC stream per receiver.
+ *   direct: select files -> code -> one receiver joins -> connect -> stream.
+ *   group:  select files -> code -> up to N receivers join -> connect each
+ *           -> one independent WebRTC stream per receiver.
+ * Receivers are connected automatically the moment they join (no approval
+ * step on the sender side); the receiver still reviews and accepts the file
+ * list before any bytes flow.
  */
 export function useSenderFlow() {
   const [phase, setPhaseState] = useState(SENDER_PHASE.IDLE);
@@ -729,7 +732,7 @@ export function useSenderFlow() {
       } catch (approvalError) {
         if (approvalError?.code === 'RECEIVER_GONE') {
           state.receivers.delete(receiverId);
-          setNotice({ kind: 'warn', text: 'A receiver left before you approved them.' });
+          setNotice({ kind: 'warn', text: 'A receiver left before they could connect.' });
           refreshGroup();
           maybeFinishGroup();
           return;
@@ -741,48 +744,6 @@ export function useSenderFlow() {
       }
     },
     [maybeFinishGroup, refreshGroup, startGroupPeer]
-  );
-
-  const approveAllReceivers = useCallback(async () => {
-    const state = refs.current;
-    if (state.mode !== SEND_MODE.GROUP || !state.signaling) return;
-    const waiting = [...state.receivers.values()].filter(
-      (row) => row.state === RECEIVER_ROW_STATE.WAITING
-    );
-    if (waiting.length === 0) return;
-    try {
-      await state.signaling.approveAll();
-      for (const row of waiting) {
-        const live = state.receivers.get(row.id);
-        if (live && live.state === RECEIVER_ROW_STATE.WAITING) {
-          live.state = RECEIVER_ROW_STATE.APPROVED;
-          startGroupPeer(row.id);
-        }
-      }
-      refreshGroup();
-    } catch (approvalError) {
-      if (approvalError?.code === 'INVALID_STATE') return;
-      setNotice({ kind: 'warn', text: describeError(approvalError).detail });
-    }
-  }, [refreshGroup, startGroupPeer]);
-
-  const declineGroupReceiver = useCallback(
-    async (receiverId) => {
-      const state = refs.current;
-      if (!state.receivers.has(receiverId)) return;
-      try {
-        if (state.signaling) {
-          await state.signaling.rejectPeer('The sender declined this receiver.', receiverId);
-        }
-      } catch {
-        /* removing the row below is enough */
-      }
-      state.receivers.delete(receiverId);
-      setNotice({ kind: 'info', text: 'A receiver was declined.' });
-      refreshGroup();
-      maybeFinishGroup();
-    },
-    [maybeFinishGroup, refreshGroup]
   );
 
   // ---------------------------------------------------------------- signaling
@@ -797,14 +758,25 @@ export function useSenderFlow() {
             refreshGroup();
             setNotice({
               kind: 'info',
-              text: `${refs.current.receivers.size} of ${refs.current.groupSize} receivers joined. Approve them to continue.`,
+              text: `${refs.current.receivers.size} of ${refs.current.groupSize} receivers joined. Connecting automatically…`,
             });
+            // No approval step: connect to each receiver as soon as they join.
+            approveGroupReceiver(receiverId);
           }
           return;
         }
-        setPeer((previous) => ({ ...previous, status: 'joined' }));
-        changePhase((current) => (current === SENDER_PHASE.WAITING ? SENDER_PHASE.PAIRED : current));
-        setNotice({ kind: 'info', text: 'A receiver joined. Approve them to continue.' });
+        // Direct mode: approve and start negotiating the moment a receiver joins.
+        setPeer((previous) => ({ ...previous, status: 'approved' }));
+        changePhase((current) =>
+          current === SENDER_PHASE.WAITING || current === SENDER_PHASE.PAIRED
+            ? SENDER_PHASE.CONNECTING
+            : current
+        );
+        setNotice({ kind: 'info', text: 'A receiver joined. Connecting automatically…' });
+        signaling
+          .approve()
+          .then(() => startPeer(signaling))
+          .catch((approvalError) => failFlow(describeError(approvalError)));
       });
 
       signaling.on(SIGNAL_EVENTS.PEER_WAITING_AGAIN, (payload) => {
@@ -813,7 +785,7 @@ export function useSenderFlow() {
           if (row && row.state === RECEIVER_ROW_STATE.WAITING) {
             refs.current.receivers.delete(payload.receiverId);
             refreshGroup();
-            setNotice({ kind: 'warn', text: 'A receiver left before approval. The code still works.' });
+            setNotice({ kind: 'warn', text: 'A receiver left before they could connect. The code still works.' });
           }
           return;
         }
@@ -821,7 +793,7 @@ export function useSenderFlow() {
         if (current === SENDER_PHASE.PAIRED || current === SENDER_PHASE.CONNECTING) {
           setPeer({ status: 'none', connection: null });
           changePhase(SENDER_PHASE.WAITING);
-          setNotice({ kind: 'warn', text: 'The receiver disconnected before approval. Share the code again.' });
+          setNotice({ kind: 'warn', text: 'The receiver disconnected before they could connect. Share the code again.' });
         }
       });
 
@@ -935,7 +907,7 @@ export function useSenderFlow() {
         setSignalingStatus(status);
       });
     },
-    [changePhase, closeSession, failFlow, maybeFinishGroup, refreshGroup]
+    [approveGroupReceiver, changePhase, closeSession, failFlow, maybeFinishGroup, refreshGroup, startPeer]
   );
 
   const startExpiryTimer = useCallback(
@@ -974,7 +946,7 @@ export function useSenderFlow() {
 
   const setGroupSize = useCallback((size) => {
     if (refs.current.phase !== SENDER_PHASE.IDLE) return;
-    const value = Number.isFinite(size) ? Math.max(2, Math.min(50, Math.floor(size))) : 3;
+    const value = Number.isFinite(size) ? Math.max(2, Math.min(100, Math.floor(size))) : 3;
     refs.current.groupSize = value;
     setGroupSizeState(value);
   }, []);
@@ -1055,48 +1027,6 @@ export function useSenderFlow() {
     startExpiryTimer,
     wireSignalingEvents,
   ]);
-
-  const approveReceiver = useCallback(
-    async (receiverId) => {
-      if (refs.current.mode === SEND_MODE.GROUP) {
-        await approveGroupReceiver(receiverId);
-        return;
-      }
-      const state = refs.current;
-      if (state.phase !== SENDER_PHASE.PAIRED || !state.signaling) return;
-      setError(null);
-      setNotice(null);
-      changePhase(SENDER_PHASE.CONNECTING);
-      setPeer((previous) => ({ ...previous, status: 'approved' }));
-      try {
-        await state.signaling.approve();
-        await startPeer(state.signaling);
-      } catch (approvalError) {
-        failFlow(describeError(approvalError));
-      }
-    },
-    [approveGroupReceiver, changePhase, failFlow, startPeer]
-  );
-
-  const declineReceiver = useCallback(
-    async (receiverId) => {
-      if (refs.current.mode === SEND_MODE.GROUP) {
-        await declineGroupReceiver(receiverId);
-        return;
-      }
-      const state = refs.current;
-      if (state.phase !== SENDER_PHASE.PAIRED) return;
-      try {
-        if (state.signaling) await state.signaling.rejectPeer('The sender declined this receiver.');
-      } catch {
-        /* closing the session below is enough */
-      }
-      setResult({ status: 'cancelled', reason: 'You declined the receiver. Generate a new code to transfer again.' });
-      changePhase(SENDER_PHASE.CANCELLED);
-      closeSession({ reason: 'declined', notify: false, delayMs: 200 });
-    },
-    [changePhase, closeSession, declineGroupReceiver]
-  );
 
   const pauseTransfer = useCallback(() => {
     const state = refs.current;
@@ -1202,9 +1132,6 @@ export function useSenderFlow() {
     loadSelection,
     setTextSelection,
     generateCode,
-    approveReceiver,
-    approveAllReceivers,
-    declineReceiver,
     pauseTransfer,
     resumeTransfer,
     cancelTransfer,

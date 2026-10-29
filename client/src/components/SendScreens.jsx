@@ -1,7 +1,5 @@
 import {
   Clock,
-  UserCheck,
-  UserX,
   Pause,
   Play,
   XCircle,
@@ -27,14 +25,14 @@ import { Spinner, StatusPill } from './Spinner.jsx';
  * screen, the live transfer screen and the terminal result screen.
  *
  * Everything after payload selection is identical for both content types -
- * the same code, approval, WebRTC, per-receiver rows and honest outcomes.
- * `contentType` only tweaks a few labels.
+ * the same code, WebRTC, per-receiver rows and honest outcomes. Receivers
+ * connect automatically when they join; `contentType` only tweaks labels.
  */
 
 /** One receiver of a group transfer: label, status pill, live progress. */
 const ROW_LABELS = {
   [RECEIVER_ROW_STATE.WAITING]: { label: 'Joined', tone: 'info' },
-  [RECEIVER_ROW_STATE.APPROVED]: { label: 'Approved', tone: 'ok' },
+  [RECEIVER_ROW_STATE.APPROVED]: { label: 'Starting…', tone: 'info' },
   [RECEIVER_ROW_STATE.CONNECTING]: { label: 'Connecting…', tone: 'info' },
   [RECEIVER_ROW_STATE.AWAITING_ACCEPT]: { label: 'Reviewing', tone: 'info' },
   [RECEIVER_ROW_STATE.TRANSFERRING]: { label: 'Receiving', tone: 'ok' },
@@ -45,10 +43,9 @@ const ROW_LABELS = {
   [RECEIVER_ROW_STATE.DISCONNECTED]: { label: 'Left', tone: 'warn' },
 };
 
-function ReceiverRow({ row, index, onApprove, onReject }) {
+function ReceiverRow({ row, index }) {
   const status = ROW_LABELS[row.state] ?? { label: row.state, tone: 'neutral' };
   const percent = row.totalBytes > 0 ? Math.floor((row.sentBytes / row.totalBytes) * 100) : 0;
-  const canAct = row.state === RECEIVER_ROW_STATE.WAITING;
   const showBytes =
     row.state === RECEIVER_ROW_STATE.TRANSFERRING ||
     row.state === RECEIVER_ROW_STATE.AWAITING_ACCEPT ||
@@ -74,23 +71,11 @@ function ReceiverRow({ row, index, onApprove, onReject }) {
           </p>
         )}
         {!showBytes && row.error && <p className="small danger-text">{row.error.detail}</p>}
-        {!showBytes && !row.error && canAct && (
-          <p className="muted small">Waiting for your approval to connect.</p>
+        {!showBytes && !row.error && row.state === RECEIVER_ROW_STATE.WAITING && (
+          <p className="muted small">Connecting automatically…</p>
         )}
       </div>
       <StatusPill {...status} />
-      {canAct && (
-        <div className="btn-group">
-          <button type="button" className="btn btn-sm" onClick={() => onApprove(row.id)}>
-            <UserCheck size={14} aria-hidden="true" />
-            Approve
-          </button>
-          <button type="button" className="btn btn-sm btn-danger" onClick={() => onReject(row.id)}>
-            <UserX size={14} aria-hidden="true" />
-            Decline
-          </button>
-        </div>
-      )}
     </div>
   );
 }
@@ -127,7 +112,6 @@ export function SendScreens({ flow, onNavigate, contentType = 'files' }) {
     phase === SENDER_PHASE.CONNECTING
   ) {
     const connection = CONNECTION_LABELS[peer.connection];
-    const waitingRows = receivers.filter((row) => row.state === RECEIVER_ROW_STATE.WAITING);
     return (
       <>
         <FlowSteps steps={STEPS} current={stepForPhase(phase)} />
@@ -170,53 +154,25 @@ export function SendScreens({ flow, onNavigate, contentType = 'files' }) {
                     {receivers.length} of {groupSize} receivers joined
                   </strong>
                   <p className="muted small">
-                    Approve each receiver (or all at once). Everyone gets their own direct
-                    connection - nobody else sees the data.
+                    Everyone gets their own direct connection automatically - nobody else sees the
+                    data.
                   </p>
                 </div>
               </div>
               {receivers.map((row, index) => (
-                <ReceiverRow
-                  key={row.id}
-                  row={row}
-                  index={index + 1}
-                  onApprove={flow.approveReceiver}
-                  onReject={flow.declineReceiver}
-                />
+                <ReceiverRow key={row.id} row={row} index={index + 1} />
               ))}
-              {waitingRows.length > 1 && (
-                <div className="btn-group">
-                  <button type="button" className="btn btn-primary" onClick={flow.approveAllReceivers}>
-                    <UserCheck size={17} aria-hidden="true" />
-                    Approve all ({waitingRows.length})
-                  </button>
-                </div>
-              )}
             </div>
           )}
 
           {!isGroup && phase === SENDER_PHASE.PAIRED && (
-            <div className="stack stack-3">
-              <div className="peer-box">
-                <Users size={20} aria-hidden="true" style={{ color: 'var(--accent)' }} />
-                <div className="grow">
-                  <strong>A receiver joined</strong>
-                  <p className="muted small">
-                    Approve them to start the direct connection and send the details.
-                  </p>
-                </div>
-                <StatusPill label="Joined" tone="info" />
+            <div className="waiting">
+              <Spinner size="lg" />
+              <div>
+                <strong>A receiver joined</strong>
+                <p className="muted small">Connecting to them automatically…</p>
               </div>
-              <div className="btn-group">
-                <button type="button" className="btn btn-primary" onClick={() => flow.approveReceiver()}>
-                  <UserCheck size={17} aria-hidden="true" />
-                  Approve & connect
-                </button>
-                <button type="button" className="btn btn-danger" onClick={() => flow.declineReceiver()}>
-                  <UserX size={17} aria-hidden="true" />
-                  Decline
-                </button>
-              </div>
+              {connection && <StatusPill {...connection} pulse />}
             </div>
           )}
 
@@ -274,7 +230,7 @@ export function SendScreens({ flow, onNavigate, contentType = 'files' }) {
                 {phase === SENDER_PHASE.AWAITING_ACCEPT
                   ? isGroup
                     ? 'Waiting for receivers'
-                    : 'Waiting for approval'
+                    : 'Waiting for the receiver to accept'
                   : isGroup
                     ? `Sending to ${activeRows.length} receivers`
                     : isText
@@ -310,13 +266,7 @@ export function SendScreens({ flow, onNavigate, contentType = 'files' }) {
           {isGroup && (
             <div className="stack stack-3">
               {receivers.map((row, index) => (
-                <ReceiverRow
-                  key={row.id}
-                  row={row}
-                  index={index + 1}
-                  onApprove={flow.approveReceiver}
-                  onReject={flow.declineReceiver}
-                />
+                <ReceiverRow key={row.id} row={row} index={index + 1} />
               ))}
             </div>
           )}

@@ -319,6 +319,24 @@ describe('SessionStore group mode', () => {
     expect(make('c'.repeat(64), 'nonsense').maxReceivers).toBe(4);
   });
 
+  it('supports up to 100 receivers per session by default', () => {
+    // Default store (no explicit cap): a group session can ask for 100.
+    const store = makeStore();
+    expect(store.maxReceiversPerSession).toBe(100);
+    const session = createGroup(store, 100);
+    expect(session.maxReceivers).toBe(100);
+    for (let i = 0; i < 100; i += 1) {
+      store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: `r${i}` });
+    }
+    expect(session.receivers.size).toBe(100);
+    try {
+      store.join({ codeHash: CODE_HASH_A, ip: '2.2.2.2', receiverSocketId: 'r101' });
+      expect.unreachable();
+    } catch (error) {
+      expect(error.code).toBe('SESSION_FULL');
+    }
+  });
+
   it('lets multiple receivers join until capacity, then SESSION_FULL', () => {
     const store = makeGroupStore();
     createGroup(store, 2);

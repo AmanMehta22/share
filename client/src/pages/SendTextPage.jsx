@@ -13,7 +13,7 @@ import { Spinner } from '../components/Spinner.jsx';
 const MAX_TEXT_LABEL = formatBytes(LIMITS.maxTextBytes);
 
 /**
- * Send a plain-text message with the same code -> approve -> WebRTC flow as
+ * Send a plain-text message with the same code -> WebRTC flow as
  * files. The payload is one flagged manifest entry; the receiver shows it
  * on screen with a copy button instead of writing it to disk.
  */
